@@ -1,0 +1,30 @@
+# Data and checkpoints (large / regenerable)
+data/
+*.pt
+*.pth
+*.ckpt
+
+# Training / evaluation run artifacts
+runs/*/
+!runs/README.md
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+.env
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Notebooks
+.ipynb_checkpoints/

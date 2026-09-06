@@ -1,0 +1,79 @@
+# Default hyperparameters for regeneration-robust watermark training/eval.
+# Every key is overridable from the CLI (see scripts/train.py, scripts/infer.py).
+
+seed: 42
+device: cuda  # cuda | cpu | cuda:0
+run_name: default
+
+# --- data ---
+data_root: ./data
+dataset: coco  # coco | div2k | imagenette | clic | synthetic
+image_size: 128
+batch_size: 4
+num_workers: 2
+num_samples: null  # optional cap for quick tests
+val_fraction: 0.1
+
+# --- model ---
+msg_len: 64
+encoder_ch: 64
+decoder_ch: 64
+
+# --- optimization ---
+lr: 1.0e-4
+epochs: 100
+lambda_perc: 1.0
+val_every: 5
+resume: null  # path to checkpoint
+
+# --- attack sampler probabilities (baseline before curriculum) ---
+# p(dist), p(regen), p(adv) corresponding to A_dist, A_regen, A_adv
+attack_probs: [0.4, 0.4, 0.2]
+
+# --- curriculum (matches train() in start.py) ---
+curriculum:
+  enabled: true
+  p_regen_start: 0.1
+  p_regen_step: 0.01
+  p_regen_max: 0.5
+  p_dist_floor: 0.2
+  p_adv: 0.2
+
+# --- DistortionBank / DiffJPEG ---
+# TODO: set use_real_diffjpeg=true when a full block-DCT + STE DiffJPEG is plugged in.
+diffjpeg:
+  quality: 50
+  use_real_diffjpeg: false
+
+distortion:
+  gaussian_std: 0.03
+
+# --- PGD adversarial attack on decoder ---
+pgd:
+  eps: 0.02
+  alpha: 0.005
+  steps: 5
+
+# --- RegenerationProxy (diffusion surrogate) ---
+# TODO: set use_placeholder=false and provide sd_model_id to load real SD VAE/UNet.
+regen:
+  use_placeholder: true
+  sd_model_id: runwayml/stable-diffusion-v1-5
+  n_steps: 4
+  t_start: 0.3
+  # placeholder text embeds shape (batch, seq, dim) when real CLIP embeds are unavailable
+  # TODO: replace with real CLIP/text-encoder embeddings.
+  text_embed_seq_len: 77
+  text_embed_dim: 768
+  guidance_scale: 2.0
+
+# --- evaluation ---
+eval:
+  attacks: [clean, jpeg, regen, guided_regen, unseen_blur]
+  # UNSEEN attack held out from training DistortionBank
+  unseen_blur_kernel: 5
+  unseen_blur_sigma: 1.5
+
+# --- logging / viz ---
+log:
+  save_best_metric: bit_acc_clean  # higher is better
