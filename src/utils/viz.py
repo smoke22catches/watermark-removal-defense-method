@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List, Mapping, Optional, Sequence
+from typing import Dict, List, Mapping, Sequence
 
 import matplotlib
 
@@ -11,6 +11,28 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+
+# Display labels for plot text (Ukrainian). Proper nouns like JPEG stay as-is.
+_ATTACK_LABELS: Dict[str, str] = {
+    "clean": "без атаки",
+    "jpeg": "JPEG",
+    "regen": "регенерація",
+    "guided_regen": "керована регенерація",
+    "unseen_blur": "невідоме розмиття",
+    "unseen": "невідома атака",
+}
+
+_LOSS_LABELS: Dict[str, str] = {
+    "loss": "загальна",
+    "loss_decode": "декодування",
+    "loss_perc": "перцептивна",
+}
+
+
+def _display_label(name: str, mapping: Mapping[str, str] | None = None) -> str:
+    if mapping and name in mapping:
+        return mapping[name]
+    return name.replace("_", " ")
 
 
 def _to_uint8_image(t: torch.Tensor) -> np.ndarray:
@@ -46,10 +68,10 @@ def plot_training_curves(
     if present:
         fig, ax = plt.subplots(figsize=(7, 4))
         for k in present:
-            ax.plot(df["epoch"], df[k], label=k)
-        ax.set_xlabel("epoch")
-        ax.set_ylabel("loss")
-        ax.set_title("Training losses")
+            ax.plot(df["epoch"], df[k], label=_display_label(k, _LOSS_LABELS))
+        ax.set_xlabel("епоха")
+        ax.set_ylabel("втрата")
+        ax.set_title("Втрати під час навчання")
         ax.legend()
         ax.grid(True, alpha=0.3)
         path = out_dir / "losses.png"
@@ -63,10 +85,11 @@ def plot_training_curves(
     if bit_cols:
         fig, ax = plt.subplots(figsize=(7, 4))
         for c in bit_cols:
-            ax.plot(df["epoch"], df[c], label=c.replace(bitacc_prefix, ""))
-        ax.set_xlabel("epoch")
-        ax.set_ylabel("bit accuracy")
-        ax.set_title("Bit accuracy vs epoch")
+            attack = c.replace(bitacc_prefix, "")
+            ax.plot(df["epoch"], df[c], label=_display_label(attack, _ATTACK_LABELS))
+        ax.set_xlabel("епоха")
+        ax.set_ylabel("точність бітів")
+        ax.set_title("Точність бітів відносно епохи")
         ax.set_ylim(0.0, 1.05)
         ax.legend()
         ax.grid(True, alpha=0.3)
@@ -82,17 +105,18 @@ def plot_training_curves(
 def plot_eval_bit_accuracy(
     results: Mapping[str, float],
     out_path: Path | str,
-    title: str = "Bit accuracy per attack",
+    title: str = "Точність бітів за атакою",
 ) -> Path:
     """Bar chart of mean bit-accuracy per attack name."""
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     names = list(results.keys())
+    labels = [_display_label(n, _ATTACK_LABELS) for n in names]
     vals = [results[k] for k in names]
     fig, ax = plt.subplots(figsize=(8, 4))
-    ax.bar(names, vals, color="#2a6f97")
+    ax.bar(labels, vals, color="#2a6f97")
     ax.set_ylim(0.0, 1.05)
-    ax.set_ylabel("bit accuracy")
+    ax.set_ylabel("точність бітів")
     ax.set_title(title)
     ax.grid(True, axis="y", alpha=0.3)
     for i, v in enumerate(vals):
@@ -118,12 +142,12 @@ def save_qualitative_grid(
     residual = residual / residual.amax().clamp_min(1e-8)
 
     cols: List[tuple[str, torch.Tensor]] = [
-        ("original", original),
-        ("watermarked", watermarked),
+        ("оригінал", original),
+        ("з водяним знаком", watermarked),
     ]
     for name, t in list(attacked.items())[:max_attacks]:
-        cols.append((name, t))
-    cols.append(("|wm-orig|", residual))
+        cols.append((_display_label(name, _ATTACK_LABELS), t))
+    cols.append(("|вз−ориг|", residual))
 
     n = len(cols)
     fig, axes = plt.subplots(1, n, figsize=(2.4 * n, 2.6))

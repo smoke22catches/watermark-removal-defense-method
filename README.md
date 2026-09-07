@@ -94,11 +94,33 @@ scripts/               # download_data, train, infer, check_env
 start.py               # original prototype (reference only)
 ```
 
-## Placeholders / TODOs
+## Placeholders / real backends
 
-- **DiffJPEG** — simplified quantization-noise approx (`diffjpeg.use_real_diffjpeg: false`).
-  Set the flag and plug in block-DCT + STE when ready.
-- **RegenerationProxy** — defaults to a lightweight placeholder
-  (`regen.use_placeholder: true`). Set `false` and provide `regen.sd_model_id` to load
-  real Stable Diffusion VAE/UNet/DDIM.
-- **text_embeds** — zero tensors matching CLIP shape; replace with a real text encoder.
+Defaults stay offline-friendly. Flip flags for production paths:
+
+```bash
+# Real block-DCT + STE DiffJPEG
+python scripts/train.py ... --set diffjpeg.use_real_diffjpeg=true
+
+# Real SD RegenerationProxy + CLIP text embeds (auto-loads CLIP when placeholder=false)
+# Requires ~4–6 GB VRAM (SD1.5 VAE+UNet fp16 @ 128², batch 1–2). image_size % 8 == 0.
+# Run `huggingface-cli login` if the model hub requires auth.
+python scripts/train.py ... --device cuda \
+  --set regen.use_placeholder=false \
+  --set regen.use_real_text_embeds=true \
+  --set regen.sd_model_id=runwayml/stable-diffusion-v1-5
+```
+
+Validate implementations:
+
+```bash
+python scripts/check_placeholders.py --skip-sd   # DiffJPEG STE + placeholder regen
+python scripts/check_placeholders.py             # also tries real SD/CLIP if CUDA+weights
+```
+
+| Flag | Default | Effect |
+|------|---------|--------|
+| `diffjpeg.use_real_diffjpeg` | `false` | Noise approx → block-DCT + STE JPEG |
+| `regen.use_placeholder` | `true` | Blur/noise proxy → SD VAE/UNet/DDIM |
+| `regen.use_real_text_embeds` | `false` | Zero embeds → CLIP (auto-on when real regen) |
+| `regen.prompt` | `""` | Unconditional null-text conditioning |

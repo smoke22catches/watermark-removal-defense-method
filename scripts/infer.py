@@ -15,9 +15,9 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.attacks.regeneration import build_regen_proxy
+from src.attacks.regeneration import build_regen_proxy, build_text_conditioner, make_text_embeds
 from src.data.datasets import build_dataloaders
-from src.engine.evaluate import evaluate, evaluate_single_image
+from src.engine.evaluate import apply_attack, evaluate, evaluate_single_image
 from src.models import Decoder, Encoder
 from src.utils.config import apply_set_overrides, load_yaml
 from src.utils.logging import RunLogger, create_run_dir
@@ -100,13 +100,32 @@ def main() -> None:
 
     encoder, decoder, msg_len = _load_models(args.checkpoint, cfg, device)
     regen_cfg = cfg.get("regen", {})
+    use_placeholder = bool(regen_cfg.get("use_placeholder", True))
+    sd_model_id = str(regen_cfg.get("sd_model_id", "runwayml/stable-diffusion-v1-5"))
+    torch_dtype = regen_cfg.get("torch_dtype")
+    local_files_only = bool(regen_cfg.get("local_files_only", False))
+
     regen_proxy = build_regen_proxy(
-        use_placeholder=bool(regen_cfg.get("use_placeholder", True)),
-        sd_model_id=str(regen_cfg.get("sd_model_id", "runwayml/stable-diffusion-v1-5")),
+        use_placeholder=use_placeholder,
+        sd_model_id=sd_model_id,
         n_steps=int(regen_cfg.get("n_steps", 4)),
         t_start=float(regen_cfg.get("t_start", 0.3)),
         device=device,
+        torch_dtype=torch_dtype,
+        local_files_only=local_files_only,
     ).to(device)
+
+    text_conditioner = build_text_conditioner(
+        use_real_text_embeds=bool(regen_cfg.get("use_real_text_embeds", False)),
+        use_placeholder_regen=use_placeholder,
+        sd_model_id=sd_model_id,
+        prompt=str(regen_cfg.get("prompt", "")),
+        device=device,
+        torch_dtype=torch_dtype,
+        local_files_only=local_files_only,
+        text_embed_seq_len=int(regen_cfg.get("text_embed_seq_len", 77)),
+        text_embed_dim=int(regen_cfg.get("text_embed_dim", 768)),
+    )
 
     try:
         if args.image:
@@ -127,6 +146,7 @@ def main() -> None:
                 attack=args.attack,
                 regen_proxy=regen_proxy,
                 config=cfg,
+                text_conditioner=text_conditioner,
             )
             logger.log(
                 f"bit_accuracy={out['bit_accuracy']:.4f}  "
@@ -179,6 +199,7 @@ def main() -> None:
                 msg_len=msg_len,
                 regen_proxy=regen_proxy,
                 config=cfg,
+                text_conditioner=text_conditioner,
             )
             means = {a: (sum(v) / len(v) if v else float("nan")) for a, v in results.items()}
             for a, m in means.items():
@@ -188,13 +209,17 @@ def main() -> None:
             # Qualitative grid from first batch
             batch = next(iter(val_loader))
             x = batch[0][:1].to(device)
-            from src.engine.evaluate import apply_attack
-            from src.attacks.regeneration import make_text_embeds
 
             m = torch.randint(0, 2, (1, msg_len), device=device).float()
             with torch.no_grad():
                 x_w = encoder(x, m)
-            text_embeds = make_text_embeds(1, device)
+            text_embeds = make_text_embeds(
+                1,
+                device,
+                seq_len=int(regen_cfg.get("text_embed_seq_len", 77)),
+                dim=int(regen_cfg.get("text_embed_dim", 768)),
+                conditioner=text_conditioner,
+            )
             attacked = {}
             for a in attacks[:4]:
                 if a == "guided_regen":

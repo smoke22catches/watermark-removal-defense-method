@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from src.attacks.distortion import DiffJPEG
-from src.attacks.regeneration import guided_regen_attack, make_text_embeds
+from src.attacks.regeneration import TextConditioner, guided_regen_attack, make_text_embeds
 
 
 def _unseen_gaussian_blur(
@@ -52,6 +52,7 @@ def apply_attack(
         return DiffJPEG(
             quality=int(dj.get("quality", 50)),
             use_real_diffjpeg=bool(dj.get("use_real_diffjpeg", False)),
+            chroma_subsample=bool(dj.get("chroma_subsample", True)),
         )(x_w)
     if name == "regen":
         if regen_proxy is None or text_embeds is None:
@@ -89,6 +90,7 @@ def evaluate(
     msg_len: int = 64,
     regen_proxy: Optional[nn.Module] = None,
     config: Optional[Mapping[str, Any]] = None,
+    text_conditioner: Optional[TextConditioner] = None,
 ) -> Dict[str, List[float]]:
     """Attack sweep over the validation loader; returns per-attack bit-accuracy lists."""
     config = config or {}
@@ -108,6 +110,7 @@ def evaluate(
             device,
             seq_len=int(regen_cfg.get("text_embed_seq_len", 77)),
             dim=int(regen_cfg.get("text_embed_dim", 768)),
+            conditioner=text_conditioner,
         )
 
         for a in attacks:
@@ -143,6 +146,7 @@ def evaluate_single_image(
     attack: Optional[str] = None,
     regen_proxy: Optional[nn.Module] = None,
     config: Optional[Mapping[str, Any]] = None,
+    text_conditioner: Optional[TextConditioner] = None,
 ) -> Dict[str, Any]:
     """Embed / optionally attack / decode a single image; report bits + PSNR/SSIM."""
     from skimage.metrics import peak_signal_noise_ratio, structural_similarity
@@ -170,6 +174,7 @@ def evaluate_single_image(
         device,
         seq_len=int(regen_cfg.get("text_embed_seq_len", 77)),
         dim=int(regen_cfg.get("text_embed_dim", 768)),
+        conditioner=text_conditioner,
     )
 
     x_test = x_w

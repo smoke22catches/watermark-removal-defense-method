@@ -11,7 +11,11 @@ from tqdm import tqdm
 
 from src.attacks.adversarial import pgd_attack_on_decoder
 from src.attacks.distortion import DistortionBank
-from src.attacks.regeneration import build_regen_proxy, make_text_embeds
+from src.attacks.regeneration import (
+    build_regen_proxy,
+    build_text_conditioner,
+    make_text_embeds,
+)
 from src.attacks.sampler import AttackSampler
 from src.engine.evaluate import evaluate
 from src.losses import PerceptualLoss, combined_loss
@@ -110,16 +114,36 @@ def train(
         jpeg_quality=int(dj.get("quality", 50)),
         gaussian_std=float(dist_cfg.get("gaussian_std", 0.03)),
         use_real_diffjpeg=bool(dj.get("use_real_diffjpeg", False)),
+        chroma_subsample=bool(dj.get("chroma_subsample", True)),
     ).to(device)
 
     regen_cfg = config.get("regen", {})
+    use_placeholder = bool(regen_cfg.get("use_placeholder", True))
+    sd_model_id = str(regen_cfg.get("sd_model_id", "runwayml/stable-diffusion-v1-5"))
+    torch_dtype = regen_cfg.get("torch_dtype")
+    local_files_only = bool(regen_cfg.get("local_files_only", False))
+
     regen_proxy = build_regen_proxy(
-        use_placeholder=bool(regen_cfg.get("use_placeholder", True)),
-        sd_model_id=str(regen_cfg.get("sd_model_id", "runwayml/stable-diffusion-v1-5")),
+        use_placeholder=use_placeholder,
+        sd_model_id=sd_model_id,
         n_steps=int(regen_cfg.get("n_steps", 4)),
         t_start=float(regen_cfg.get("t_start", 0.3)),
         device=device,
+        torch_dtype=torch_dtype,
+        local_files_only=local_files_only,
     ).to(device)
+
+    text_conditioner = build_text_conditioner(
+        use_real_text_embeds=bool(regen_cfg.get("use_real_text_embeds", False)),
+        use_placeholder_regen=use_placeholder,
+        sd_model_id=sd_model_id,
+        prompt=str(regen_cfg.get("prompt", "")),
+        device=device,
+        torch_dtype=torch_dtype,
+        local_files_only=local_files_only,
+        text_embed_seq_len=int(regen_cfg.get("text_embed_seq_len", 77)),
+        text_embed_dim=int(regen_cfg.get("text_embed_dim", 768)),
+    )
 
     pgd = config.get("pgd", {})
     probs = tuple(config.get("attack_probs", [0.4, 0.4, 0.2]))
@@ -173,6 +197,7 @@ def train(
                 device,
                 seq_len=int(regen_cfg.get("text_embed_seq_len", 77)),
                 dim=int(regen_cfg.get("text_embed_dim", 768)),
+                conditioner=text_conditioner,
             )
             stats = train_step(
                 x,
@@ -215,6 +240,7 @@ def train(
                 msg_len=msg_len,
                 regen_proxy=regen_proxy,
                 config=config,
+                text_conditioner=text_conditioner,
             )
             for a, vals in eval_out.items():
                 if vals:

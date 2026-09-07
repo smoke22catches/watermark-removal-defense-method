@@ -40,10 +40,11 @@ curriculum:
   p_adv: 0.2
 
 # --- DistortionBank / DiffJPEG ---
-# TODO: set use_real_diffjpeg=true when a full block-DCT + STE DiffJPEG is plugged in.
+# Set use_real_diffjpeg=true for block-DCT + STE JPEG (see src/attacks/diffjpeg_real.py).
 diffjpeg:
   quality: 50
   use_real_diffjpeg: false
+  chroma_subsample: true
 
 distortion:
   gaussian_std: 0.03
@@ -55,14 +56,18 @@ pgd:
   steps: 5
 
 # --- RegenerationProxy (diffusion surrogate) ---
-# TODO: set use_placeholder=false and provide sd_model_id to load real SD VAE/UNet.
+# Set use_placeholder=false to load real SD VAE/UNet/DDIM from sd_model_id.
+# CLIP text embeds load automatically when the real proxy is used (or when
+# use_real_text_embeds=true). image_size should be a multiple of 8 for the VAE.
 regen:
   use_placeholder: true
   sd_model_id: runwayml/stable-diffusion-v1-5
   n_steps: 4
   t_start: 0.3
-  # placeholder text embeds shape (batch, seq, dim) when real CLIP embeds are unavailable
-  # TODO: replace with real CLIP/text-encoder embeddings.
+  torch_dtype: null  # null → fp16 on CUDA, fp32 on CPU
+  local_files_only: false
+  use_real_text_embeds: false
+  prompt: ""  # empty = unconditional null-text (DiffPure / regen style)
   text_embed_seq_len: 77
   text_embed_dim: 768
   guidance_scale: 2.0
