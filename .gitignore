@@ -1,5 +1,6 @@
 # Data and checkpoints (large / regenerable)
 data/
+!src/data/
 *.pt
 *.pth
 *.ckpt
