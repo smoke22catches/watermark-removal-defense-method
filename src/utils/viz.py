@@ -80,13 +80,25 @@ def plot_training_curves(
         plt.close(fig)
         saved.append(path)
 
-    # Bit-accuracy per attack
+    # Bit-accuracy per attack.
+    # Validation runs only every val_every epochs, so non-eval rows are NaN.
+    # Matplotlib breaks lines at NaN and draws no markers by default, so those
+    # isolated validation points are invisible unless we drop NaNs first.
     bit_cols = [c for c in df.columns if c.startswith(bitacc_prefix)]
     if bit_cols:
         fig, ax = plt.subplots(figsize=(7, 4))
         for c in bit_cols:
             attack = c.replace(bitacc_prefix, "")
-            ax.plot(df["epoch"], df[c], label=_display_label(attack, _ATTACK_LABELS))
+            sub = df[["epoch", c]].dropna()
+            if sub.empty:
+                continue
+            ax.plot(
+                sub["epoch"],
+                sub[c],
+                label=_display_label(attack, _ATTACK_LABELS),
+                marker="o",
+                markersize=3,
+            )
         ax.set_xlabel("епоха")
         ax.set_ylabel("точність бітів")
         ax.set_title("Точність бітів відносно епохи")

@@ -48,8 +48,12 @@ def main() -> None:
     )
     logger.log(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
 
-    msg_len = int(cfg.get("msg_len", 64))
-    encoder = Encoder(msg_len=msg_len, ch=int(cfg.get("encoder_ch", 64)))
+    msg_len = int(cfg.get("msg_len", 16))
+    encoder = Encoder(
+        msg_len=msg_len,
+        ch=int(cfg.get("encoder_ch", 64)),
+        strength=float(cfg.get("encoder_strength", 0.4)),
+    )
     decoder = Decoder(msg_len=msg_len, ch=int(cfg.get("decoder_ch", 64)))
 
     try:

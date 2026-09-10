@@ -85,6 +85,7 @@ def add_common_train_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--num-samples", type=int, default=None)
     parser.add_argument("--msg-len", type=int, default=None)
+    parser.add_argument("--encoder-strength", type=float, default=None, dest="encoder_strength")
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--lambda-perc", type=float, default=None)
@@ -113,6 +114,7 @@ def config_from_args(args: argparse.Namespace) -> Dict[str, Any]:
         "num_workers": "num_workers",
         "num_samples": "num_samples",
         "msg_len": "msg_len",
+        "encoder_strength": "encoder_strength",
         "lr": "lr",
         "epochs": "epochs",
         "lambda_perc": "lambda_perc",

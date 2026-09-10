@@ -8,36 +8,43 @@ run_name: default
 # --- data ---
 data_root: ./data
 dataset: coco  # coco | div2k | imagenette | clic | synthetic
-image_size: 128
-batch_size: 4
+image_size: 64
+batch_size: 8
 num_workers: 2
 num_samples: null  # optional cap for quick tests
 val_fraction: 0.1
 
 # --- model ---
-msg_len: 64
+# 16 bits is a reliable warm-start capacity; raise after clean bit-acc is high.
+msg_len: 16
 encoder_ch: 64
 decoder_ch: 64
+encoder_strength: 0.4
 
 # --- optimization ---
-lr: 1.0e-4
+lr: 2.0e-3
 epochs: 100
-lambda_perc: 1.0
+# Keep perceptual weight low so decode loss can form a watermark channel first.
+lambda_perc: 0.05
 val_every: 5
 resume: null  # path to checkpoint
 
 # --- attack sampler probabilities (baseline before curriculum) ---
-# p(dist), p(regen), p(adv) corresponding to A_dist, A_regen, A_adv
-attack_probs: [0.4, 0.4, 0.2]
+# p(dist), p(regen), p(adv); residual probability is clean (identity).
+attack_probs: [0.3, 0.3, 0.2]
 
-# --- curriculum (matches train() in start.py) ---
+# --- curriculum ---
+# Warm-start: clean-only embed→decode (λ_perc≈0), then ramp attacks.
 curriculum:
   enabled: true
-  p_regen_start: 0.1
-  p_regen_step: 0.01
-  p_regen_max: 0.5
-  p_dist_floor: 0.2
-  p_adv: 0.2
+  warm_start_epochs: 50
+  warm_lambda_perc: 0.0
+  p_regen_start: 0.05
+  p_regen_step: 0.008
+  p_regen_max: 0.3
+  p_dist_floor: 0.15
+  p_adv: 0.1
+  p_clean_floor: 0.25
 
 # --- DistortionBank / DiffJPEG ---
 # Set use_real_diffjpeg=true for block-DCT + STE JPEG (see src/attacks/diffjpeg_real.py).
