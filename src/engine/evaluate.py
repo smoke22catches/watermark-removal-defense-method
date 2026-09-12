@@ -6,29 +6,24 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from src.attacks.distortion import DiffJPEG
-from src.attacks.regeneration import TextConditioner, guided_regen_attack, make_text_embeds
-
-
-def _unseen_gaussian_blur(
-    x: torch.Tensor,
-    kernel_size: int = 5,
-    sigma: float = 1.5,
-) -> torch.Tensor:
-    """UNSEEN attack: Gaussian blur not present in DistortionBank training set."""
-    # Separable approx via avg-pool stacks is avoided; use conv with fixed Gaussian kernel.
-    if kernel_size % 2 == 0:
-        kernel_size += 1
-    coords = torch.arange(kernel_size, device=x.device, dtype=x.dtype) - kernel_size // 2
-    g = torch.exp(-(coords**2) / (2 * sigma**2))
-    g = g / g.sum()
-    kernel_2d = g[:, None] * g[None, :]
-    kernel = kernel_2d.expand(x.size(1), 1, kernel_size, kernel_size).contiguous()
-    pad = kernel_size // 2
-    return F.conv2d(x, kernel, padding=pad, groups=x.size(1)).clamp(-1, 1)
+from src.attacks.registry import (
+    ATTACK_REGISTRY,
+    apply_spec,
+    default_strength,
+    get_attack,
+)
+from src.attacks.regeneration import TextConditioner, make_text_embeds
+from src.utils.metrics import (
+    FIDMeter,
+    LPIPSMeter,
+    bit_accuracy_per_image,
+    long_row,
+    psnr_batch,
+    ssim_batch,
+    tpr_at_fpr,
+)
 
 
 def apply_attack(
@@ -39,45 +34,172 @@ def apply_attack(
     regen_proxy: Optional[nn.Module],
     text_embeds: Optional[torch.Tensor],
     config: Optional[Mapping[str, Any]] = None,
+    strength: Optional[float] = None,
 ) -> torch.Tensor:
-    """Apply a named attack for evaluation."""
+    """Apply a named attack for evaluation (registry-backed)."""
     config = config or {}
-    dj = config.get("diffjpeg", {})
-    regen_cfg = config.get("regen", {})
-    eval_cfg = config.get("eval", {})
+    alias = "unseen_blur" if name == "unseen" else name
+    try:
+        spec = get_attack(alias)
+    except KeyError as e:
+        raise ValueError(f"Unknown attack: {name}") from e
+    return apply_spec(
+        spec,
+        x_w,
+        strength=strength,
+        message=m,
+        decoder=decoder,
+        regen_proxy=regen_proxy,
+        text_embeds=text_embeds,
+        config=config,
+    )
 
-    if name == "clean":
-        return x_w
-    if name == "jpeg":
-        return DiffJPEG(
-            quality=int(dj.get("quality", 50)),
-            use_real_diffjpeg=bool(dj.get("use_real_diffjpeg", False)),
-            chroma_subsample=bool(dj.get("chroma_subsample", True)),
-        )(x_w)
-    if name == "regen":
-        if regen_proxy is None or text_embeds is None:
-            raise ValueError("regen attack requires regen_proxy and text_embeds")
-        return regen_proxy(x_w, text_embeds)
-    if name == "guided_regen":
-        if regen_proxy is None or text_embeds is None:
-            raise ValueError("guided_regen requires regen_proxy and text_embeds")
-        return guided_regen_attack(
-            x_w,
-            decoder,
-            m,
-            regen_proxy,
-            text_embeds,
-            guidance_scale=float(regen_cfg.get("guidance_scale", 2.0)),
-        )
-    if name in ("unseen_blur", "unseen"):
-        return _unseen_gaussian_blur(
-            x_w,
-            kernel_size=int(eval_cfg.get("unseen_blur_kernel", 5)),
-            sigma=float(eval_cfg.get("unseen_blur_sigma", 1.5)),
-        )
-    if name == "noise":
-        return torch.clamp(x_w + torch.randn_like(x_w) * 0.05, -1, 1)
-    raise ValueError(f"Unknown attack: {name}")
+
+def _needs_grad(attack_id: str) -> bool:
+    return attack_id in ("guided_regen", "adv")
+
+
+def evaluate_protocol(
+    encoder: nn.Module,
+    decoder: nn.Module,
+    val_loader: DataLoader,
+    device: str = "cuda",
+    attacks: Optional[Sequence[str]] = None,
+    msg_len: int = 64,
+    regen_proxy: Optional[nn.Module] = None,
+    config: Optional[Mapping[str, Any]] = None,
+    text_conditioner: Optional[TextConditioner] = None,
+    seed: int = 0,
+    epoch: Any = "",
+    sweep_strengths: bool = False,
+    compute_detection: bool = True,
+    compute_fid: bool = True,
+    compute_quality: bool = True,
+    quality_only: bool = False,
+) -> List[Dict[str, Any]]:
+    """Full evaluation protocol → long-format rows (bit-acc, TPR, PSNR/SSIM/LPIPS/FID)."""
+    config = config or {}
+    regen_cfg = config.get("regen", {})
+    encoder.eval()
+    decoder.eval()
+
+    if attacks is None:
+        attacks = [s.id for s in ATTACK_REGISTRY]
+    if quality_only:
+        attacks = ["clean"]
+
+    lpips_meter = LPIPSMeter().to(device) if compute_quality else None
+    rows: List[Dict[str, Any]] = []
+
+    for attack_id in attacks:
+        try:
+            spec = get_attack("unseen_blur" if attack_id == "unseen" else attack_id)
+        except KeyError:
+            print(f"[eval] skipping unknown attack '{attack_id}'")
+            continue
+        strengths: Sequence[float]
+        if sweep_strengths:
+            strengths = spec.strengths
+        else:
+            strengths = (default_strength(spec),)
+
+        for strength in strengths:
+            fid = FIDMeter(device=device) if compute_fid and compute_quality else None
+            bit_accs: List[float] = []
+            scores_pos: List[float] = []
+            scores_neg: List[float] = []
+            psnrs: List[float] = []
+            ssims: List[float] = []
+            lpips_vals: List[float] = []
+
+            for batch in val_loader:
+                x = batch[0].to(device)
+                m = torch.randint(0, 2, (x.size(0), msg_len), device=device).float()
+                with torch.no_grad():
+                    x_w = encoder(x, m)
+                text_embeds = make_text_embeds(
+                    x.size(0),
+                    device,
+                    seq_len=int(regen_cfg.get("text_embed_seq_len", 77)),
+                    dim=int(regen_cfg.get("text_embed_dim", 768)),
+                    conditioner=text_conditioner,
+                )
+
+                def _run_attack() -> torch.Tensor:
+                    return apply_spec(
+                        spec,
+                        x_w,
+                        strength=float(strength),
+                        message=m,
+                        decoder=decoder,
+                        regen_proxy=regen_proxy,
+                        text_embeds=text_embeds,
+                        config=config,
+                    )
+
+                if _needs_grad(spec.id):
+                    with torch.enable_grad():
+                        x_test = _run_attack()
+                else:
+                    with torch.no_grad():
+                        x_test = _run_attack()
+
+                with torch.no_grad():
+                    logits = decoder(x_test)
+                    acc = bit_accuracy_per_image(logits, m)
+                    bit_accs.extend(acc.detach().cpu().tolist())
+                    scores_pos.extend(acc.detach().cpu().tolist())
+                    if compute_detection:
+                        logits_neg = decoder(x)
+                        scores_neg.extend(
+                            bit_accuracy_per_image(logits_neg, m).detach().cpu().tolist()
+                        )
+                    if compute_quality:
+                        # Attacked image vs original cover (paired quality).
+                        psnrs.extend(psnr_batch(x, x_test))
+                        ssims.extend(ssim_batch(x, x_test))
+                        if lpips_meter is not None:
+                            lpips_vals.extend(lpips_meter(x, x_test))
+                        if fid is not None:
+                            fid.update(x, x_test)
+
+            def _mean(vals: List[float]) -> float:
+                return float(sum(vals) / len(vals)) if vals else float("nan")
+
+            seen = "true" if spec.seen_in_training else "false"
+            common = dict(
+                epoch=epoch,
+                seed=seed,
+                attack=spec.id,
+                strength=float(strength),
+                epsilon=spec.epsilon,
+                delta=spec.delta,
+                knowledge_level=spec.knowledge_level,
+                seen_flag=seen,
+            )
+
+            def _emit(name: str, value: Any) -> None:
+                rows.append(long_row(metric_name=name, metric_value=value, **common))
+
+            _emit("bit_accuracy", _mean(bit_accs))
+            if compute_detection:
+                _emit("tpr_at_0.1pct_fpr", tpr_at_fpr(scores_pos, scores_neg, 0.001))
+                _emit("tpr_at_1pct_fpr", tpr_at_fpr(scores_pos, scores_neg, 0.01))
+            if compute_quality:
+                _emit("psnr", _mean(psnrs))
+                _emit("ssim", _mean(ssims))
+                _emit("lpips", _mean(lpips_vals))
+                if fid is not None:
+                    _emit("fid", fid.compute())
+                    _emit("fid_backend", fid.backend)
+
+            mean_acc = _mean(bit_accs)
+            if bit_accs:
+                print(f"{spec.id} strength={strength}: bit-accuracy = {mean_acc:.4f}")
+            else:
+                print(f"{spec.id} strength={strength}: bit-accuracy = n/a")
+
+    return rows
 
 
 @torch.no_grad()
@@ -92,41 +214,32 @@ def evaluate(
     config: Optional[Mapping[str, Any]] = None,
     text_conditioner: Optional[TextConditioner] = None,
 ) -> Dict[str, List[float]]:
-    """Attack sweep over the validation loader; returns per-attack bit-accuracy lists."""
-    config = config or {}
-    regen_cfg = config.get("regen", {})
-    encoder.eval()
-    decoder.eval()
+    """Attack sweep over the validation loader; returns per-attack bit-accuracy lists.
 
-    # guided_regen needs grad on the attacked image; disable no_grad selectively below
+    Backward-compatible wrapper around :func:`evaluate_protocol`.
+    """
+    rows = evaluate_protocol(
+        encoder,
+        decoder,
+        val_loader,
+        device=device,
+        attacks=list(attacks),
+        msg_len=msg_len,
+        regen_proxy=regen_proxy,
+        config=config,
+        text_conditioner=text_conditioner,
+        sweep_strengths=False,
+        compute_detection=False,
+        compute_fid=False,
+        compute_quality=False,
+    )
     results: Dict[str, List[float]] = {a: [] for a in attacks}
-
-    for batch in val_loader:
-        x = batch[0].to(device)
-        m = torch.randint(0, 2, (x.size(0), msg_len), device=device).float()
-        x_w = encoder(x, m)
-        text_embeds = make_text_embeds(
-            x.size(0),
-            device,
-            seq_len=int(regen_cfg.get("text_embed_seq_len", 77)),
-            dim=int(regen_cfg.get("text_embed_dim", 768)),
-            conditioner=text_conditioner,
-        )
-
-        for a in attacks:
-            if a == "guided_regen":
-                # Needs autograd inside guided_regen_attack
-                with torch.enable_grad():
-                    x_test = apply_attack(
-                        a, x_w, m, decoder, regen_proxy, text_embeds, config
-                    )
-            else:
-                x_test = apply_attack(a, x_w, m, decoder, regen_proxy, text_embeds, config)
-
-            logits = decoder(x_test)
-            bit_acc = ((torch.sigmoid(logits) > 0.5).float() == m).float().mean().item()
-            results[a].append(bit_acc)
-
+    for row in rows:
+        if row.get("metric_name") == "bit_accuracy":
+            try:
+                results[str(row["attack"])].append(float(row["metric_value"]))
+            except (TypeError, ValueError, KeyError):
+                pass
     for a in attacks:
         if results[a]:
             mean_acc = sum(results[a]) / len(results[a])
@@ -179,7 +292,7 @@ def evaluate_single_image(
 
     x_test = x_w
     if attack and attack != "clean":
-        if attack == "guided_regen":
+        if _needs_grad(attack):
             with torch.enable_grad():
                 x_test = apply_attack(
                     attack, x_w, m, decoder, regen_proxy, text_embeds, config

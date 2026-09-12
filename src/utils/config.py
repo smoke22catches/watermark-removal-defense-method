@@ -91,6 +91,20 @@ def add_common_train_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--regen-steps", type=int, default=None, dest="regen_steps")
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument(
+        "--regen-branch",
+        type=str,
+        default=None,
+        choices=["ddim_proxy", "blur_surrogate", "none"],
+        help="Regeneration training branch: differentiable DDIM proxy, "
+        "matched Gaussian blur, or disabled",
+    )
+    parser.add_argument(
+        "--export-algorithm",
+        type=str,
+        default=None,
+        help="Write a LaTeX algorithm/algorithmic block reflecting the actual training loop",
+    )
+    parser.add_argument(
         "--set",
         dest="set_overrides",
         action="append",
@@ -117,6 +131,8 @@ def config_from_args(args: argparse.Namespace) -> Dict[str, Any]:
         "epochs": "epochs",
         "lambda_perc": "lambda_perc",
         "resume": "resume",
+        "regen_branch": "regen_branch",
+        "export_algorithm": "export_algorithm",
     }
     for attr, key in mapping.items():
         val = getattr(args, attr, None)
@@ -126,4 +142,5 @@ def config_from_args(args: argparse.Namespace) -> Dict[str, Any]:
         cfg.setdefault("regen", {})
         cfg["regen"]["n_steps"] = args.regen_steps
     apply_set_overrides(cfg, getattr(args, "set_overrides", None))
+    cfg.setdefault("regen_branch", "ddim_proxy")
     return cfg

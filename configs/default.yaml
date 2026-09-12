@@ -55,6 +55,9 @@ pgd:
   alpha: 0.005
   steps: 5
 
+# Regeneration training branch: ddim_proxy | blur_surrogate | none
+regen_branch: ddim_proxy
+
 # --- RegenerationProxy (diffusion surrogate) ---
 # Set use_placeholder=false to load real SD VAE/UNet/DDIM from sd_model_id.
 # CLIP text embeds load automatically when the real proxy is used (or when

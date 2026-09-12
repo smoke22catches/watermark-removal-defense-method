@@ -1,0 +1,37 @@
+% Auto-generated from the resolved training config and loop. Do not edit by hand.
+\begin{algorithm}[t]
+\caption{Навчання запропонованого методу (мінімакс із навчальним планом)}
+\label{alg:train}
+\begin{algorithmic}[1]
+\REQUIRE Cover dataset, epochs $E=2$, payload $L=64$\,bit, image size $64$,
+         batch $2$, Adam $\eta=0.0001$, $\lambda_{\mathrm{perc}}=1.0$,
+         regen-branch $\mathtt{ddim_proxy}$, PGD $(\varepsilon=0.02,\ \alpha=0.005,\ T=5)$
+\ENSURE Encoder $E_\theta$, Decoder $D_\phi$
+\FOR{$e = 0$ \TO $1$}
+  \STATE Update curriculum:
+  \STATE \quad $p_{\mathrm{regen}} \gets \min(0.1 + 0.01\cdot e,\ 0.5)$
+  \STATE \quad $p_{\mathrm{dist}} \gets \max(0.5 - p_{\mathrm{regen}},\ 0.2)$
+  \STATE \quad $p_{\mathrm{adv}} \gets 0.2$
+  \FOR{each minibatch $x$}
+    \STATE Sample message $m \sim \mathrm{Bernoulli}(1/2)^{L}$
+    \STATE $x_w \gets E_\theta(x, m)$ \COMMENT{leader: embed}
+    \STATE Sample attack type from $\{dist, regen, adv\}$ with $(p_{\mathrm{dist}}, p_{\mathrm{regen}}, p_{\mathrm{adv}})$
+    \IF{type $=$ dist}
+      \STATE $x' \gets \mathrm{DistortionBank}(x_w)$ \COMMENT{JPEG / noise / downsample}
+    \ELSIF{type $=$ regen}
+        \STATE $x' \gets \mathrm{RegenerationProxy}_{\mathrm{DDIM}}(x_w; n_{\mathrm{steps}}=4, t_{\mathrm{start}}=0.3)$
+    \ELSE
+      \STATE $x' \gets \mathrm{PGD}_{D_\phi}(x_w, m; \varepsilon=0.02, \alpha=0.005, T=5)$
+      \COMMENT{follower; gradient reaches $x_w$}
+    \ENDIF
+    \STATE $\hat{z} \gets D_\phi(x')$
+    \STATE $\mathcal{L} \gets \mathcal{L}_{\mathrm{dec}}(\hat{z}, m) + 1.0\,\mathcal{L}_{\mathrm{perc}}(x_w, x)$
+    \STATE Adam update of $\theta, \phi$ on $\nabla \mathcal{L}$
+    \COMMENT{minimax cadence: one follower attack then one leader step per batch}
+  \ENDFOR
+  \IF{$e \bmod 1 = 0$}
+    \STATE Validate bit accuracy and PSNR/SSIM/LPIPS per attack
+  \ENDIF
+\ENDFOR
+\end{algorithmic}
+\end{algorithm}

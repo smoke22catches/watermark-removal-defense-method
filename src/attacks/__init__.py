@@ -10,6 +10,12 @@ from .regeneration import (
     guided_regen_attack,
     make_text_embeds,
 )
+from .registry import (
+    ATTACK_REGISTRY,
+    GaussianBlurSurrogate,
+    apply_spec,
+    get_attack,
+)
 from .sampler import AttackSampler
 
 __all__ = [
@@ -23,4 +29,8 @@ __all__ = [
     "make_text_embeds",
     "pgd_attack_on_decoder",
     "AttackSampler",
+    "ATTACK_REGISTRY",
+    "GaussianBlurSurrogate",
+    "apply_spec",
+    "get_attack",
 ]
