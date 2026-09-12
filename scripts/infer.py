@@ -100,7 +100,11 @@ def parse_args() -> argparse.Namespace:
 def _load_models(ckpt_path: str, cfg: dict, device: str):
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     msg_len = int(cfg.get("msg_len", ckpt.get("config", {}).get("msg_len", 64)))
-    encoder = Encoder(msg_len=msg_len, ch=int(cfg.get("encoder_ch", 64)))
+    encoder = Encoder(
+        msg_len=msg_len,
+        ch=int(cfg.get("encoder_ch", 64)),
+        strength=float(cfg.get("encoder_strength", 0.4)),
+    )
     decoder = Decoder(msg_len=msg_len, ch=int(cfg.get("decoder_ch", 64)))
     encoder.load_state_dict(ckpt["encoder"])
     decoder.load_state_dict(ckpt["decoder"])

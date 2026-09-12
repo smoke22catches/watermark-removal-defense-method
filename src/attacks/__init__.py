@@ -1,6 +1,6 @@
 """Attack modules: distortion, regeneration, PGD, and sampling."""
 
-from .adversarial import pgd_attack_on_decoder
+from .adversarial import pgd_attack_on_decoder, straight_through
 from .distortion import DiffJPEG, DistortionBank
 from .regeneration import (
     RegenerationProxy,
@@ -28,6 +28,7 @@ __all__ = [
     "build_text_conditioner",
     "make_text_embeds",
     "pgd_attack_on_decoder",
+    "straight_through",
     "AttackSampler",
     "ATTACK_REGISTRY",
     "GaussianBlurSurrogate",

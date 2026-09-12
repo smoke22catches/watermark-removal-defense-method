@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from src.attacks.adversarial import pgd_attack_on_decoder
+from src.attacks.adversarial import pgd_attack_on_decoder, straight_through
 from src.attacks.distortion import DistortionBank
 from src.attacks.registry import (
     GaussianBlurSurrogate,
@@ -54,24 +54,32 @@ def train_step(
     pgd_alpha: float = 0.005,
     pgd_steps: int = 5,
 ) -> Dict[str, Any]:
-    """One Stackelberg min-max training step (leader embed → follower attack → decode)."""
+    """One Stackelberg min-max training step (leader embed → follower attack → decode).
+
+    Attacks may be non-differentiable; a straight-through estimator routes decode
+    gradients back to the encoder through ``x_w``.
+    """
     b = x.size(0)
     m = torch.randint(0, 2, (b, msg_len), device=device).float()
 
-    # --- Крок "лідера": вбудовування ---
+    # --- Leader: embed ---
     x_w = encoder(x, m)
 
-    # --- Крок "послідовника": семплована атака з поточного простору 𝒜 ---
+    # --- Follower: sample attack (no_grad for speed; STE restores encoder path) ---
     with torch.no_grad():
         x_attacked, attack_type = attack_sampler(x_w, m, text_embeds)
-        # для adv-гілки потрібен градієнт через x_w -> тому PGD рахується окремо вище на живому графі
 
     if attack_type == "adv":
         x_attacked = pgd_attack_on_decoder(
             x_w, m, decoder, eps=pgd_eps, alpha=pgd_alpha, steps=pgd_steps
-        )  # перерахунок із градієнтом до x_w
+        )
+    elif attack_type == "clean":
+        x_attacked = x_w
 
-    # --- декодування та функція втрат (відповідає формулі з Кроку 4 моделі) ---
+    # STE: forward = attacked image; backward = identity on x_w (except clean).
+    if attack_type != "clean":
+        x_attacked = straight_through(x_w, x_attacked)
+
     logits = decoder(x_attacked)
     loss, loss_decode, loss_perc = combined_loss(
         logits, m, x_w, x, perc_loss, lambda_perc=lambda_perc
@@ -89,27 +97,59 @@ def train_step(
     }
 
 
-def _update_curriculum(attack_sampler: AttackSampler, epoch: int, cfg: Mapping[str, Any]) -> None:
-    """Curriculum: increase A_regen share with epochs (matches start.py train())."""
+def _curriculum_probs(epoch: int, cfg: Mapping[str, Any]) -> Tuple[float, float, float]:
+    """Return (p_dist, p_regen, p_adv); residual 1-sum is clean."""
     cur = cfg.get("curriculum", {})
-    pgd = cfg.get("pgd", {})
-    p_adv = float(cur.get("p_adv", 0.2)) if cur else float(cfg.get("attack_probs", [0.4, 0.4, 0.2])[2])
+    p_adv_default = float(cfg.get("attack_probs", [0.4, 0.4, 0.2])[2])
+    p_adv = float(cur.get("p_adv", 0.2)) if cur else p_adv_default
     regen_branch = str(cfg.get("regen_branch", "ddim_proxy"))
 
     if regen_branch == "none":
-        attack_sampler.probs = (max(0.0, 1.0 - p_adv), 0.0, p_adv)
-        return
+        return max(0.0, 1.0 - p_adv), 0.0, p_adv
 
     if not cur.get("enabled", True):
-        return
+        probs = cfg.get("attack_probs", [0.4, 0.4, 0.2])
+        return float(probs[0]), float(probs[1]), float(probs[2])
+
+    warm = int(cur.get("warm_start_epochs", 0))
+    if epoch < warm:
+        return 0.0, 0.0, 0.0
+
+    # Epochs after warm-start: ramp regen while keeping a clean floor.
+    t = epoch - warm
     p_regen = min(
-        float(cur.get("p_regen_start", 0.1)) + float(cur.get("p_regen_step", 0.01)) * epoch,
-        float(cur.get("p_regen_max", 0.5)),
+        float(cur.get("p_regen_start", 0.1)) + float(cur.get("p_regen_step", 0.01)) * t,
+        float(cur.get("p_regen_max", 0.4)),
     )
+    p_adv = float(cur.get("p_adv", 0.15))
     p_dist_floor = float(cur.get("p_dist_floor", 0.2))
-    p_adv = float(cur.get("p_adv", 0.2))
-    attack_sampler.probs = (max(0.5 - p_regen, p_dist_floor), p_regen, p_adv)
-    _ = pgd
+    p_clean_floor = float(cur.get("p_clean_floor", 0.2))
+
+    # Allocate: clean floor + adv + regen, remainder → dist (at least p_dist_floor).
+    p_dist = max(p_dist_floor, 1.0 - p_regen - p_adv - p_clean_floor)
+    # Renormalize if over-allocated.
+    total = p_dist + p_regen + p_adv
+    max_attack = 1.0 - p_clean_floor
+    if total > max_attack and total > 0:
+        scale = max_attack / total
+        p_dist, p_regen, p_adv = p_dist * scale, p_regen * scale, p_adv * scale
+    return p_dist, p_regen, p_adv
+
+
+def _lambda_perc_for_epoch(epoch: int, cfg: Mapping[str, Any]) -> float:
+    """Optional lower perceptual weight during warm-start."""
+    base = float(cfg.get("lambda_perc", 0.1))
+    cur = cfg.get("curriculum", {})
+    warm = int(cur.get("warm_start_epochs", 0))
+    warm_lp = cur.get("warm_lambda_perc")
+    if warm_lp is not None and epoch < warm:
+        return float(warm_lp)
+    return base
+
+
+def _update_curriculum(attack_sampler: AttackSampler, epoch: int, cfg: Mapping[str, Any]) -> None:
+    """Curriculum: clean warm-start, then increase attack share with a clean floor."""
+    attack_sampler.probs = _curriculum_probs(epoch, cfg)
 
 
 def _build_regen_branch(
@@ -318,7 +358,6 @@ def train(
 
     epochs = int(config.get("epochs", 100))
     msg_len = int(config.get("msg_len", 64))
-    lambda_perc = float(config.get("lambda_perc", 1.0))
     val_every = int(config.get("val_every", 5))
     eval_attacks = list(
         config.get("eval", {}).get(
@@ -333,10 +372,19 @@ def train(
     train_t0 = time.perf_counter()
     latency_images: Optional[torch.Tensor] = None
 
+    if logger:
+        warm = int(config.get("curriculum", {}).get("warm_start_epochs", 0))
+        logger.log(
+            f"Curriculum: warm_start_epochs={warm}, "
+            f"lambda_perc={config.get('lambda_perc')}, "
+            f"STE enabled for attacked steps"
+        )
+
     for epoch in range(start_epoch, epochs):
         encoder.train()
         decoder.train()
         _update_curriculum(attack_sampler, epoch, config)
+        lambda_perc = _lambda_perc_for_epoch(epoch, config)
         reset_peak_gpu_memory()
         t_epoch = time.perf_counter()
 
@@ -380,12 +428,17 @@ def train(
         epoch_times.append(elapsed)
         epoch_mem.append(peak_mem)
 
+        p_dist, p_regen, p_adv = attack_sampler.probs
         wide: Dict[str, Any] = {
             "epoch": epoch,
             "loss": epoch_stats["loss"] / n,
             "loss_decode": epoch_stats["loss_decode"] / n,
             "loss_perc": epoch_stats["loss_perc"] / n,
-            "p_regen": attack_sampler.probs[1],
+            "lambda_perc": lambda_perc,
+            "p_clean": attack_sampler.p_clean,
+            "p_regen": p_regen,
+            "p_dist": p_dist,
+            "p_adv": p_adv,
             "wall_clock_s": elapsed,
             "peak_gpu_memory_bytes": peak_mem,
         }
@@ -394,7 +447,11 @@ def train(
             long_row(epoch=epoch, seed=seed, attack="train", metric_name="loss", metric_value=wide["loss"]),
             long_row(epoch=epoch, seed=seed, attack="train", metric_name="loss_decode", metric_value=wide["loss_decode"]),
             long_row(epoch=epoch, seed=seed, attack="train", metric_name="loss_perc", metric_value=wide["loss_perc"]),
-            long_row(epoch=epoch, seed=seed, attack="train", metric_name="p_regen", metric_value=wide["p_regen"]),
+            long_row(epoch=epoch, seed=seed, attack="train", metric_name="lambda_perc", metric_value=lambda_perc),
+            long_row(epoch=epoch, seed=seed, attack="train", metric_name="p_clean", metric_value=wide["p_clean"]),
+            long_row(epoch=epoch, seed=seed, attack="train", metric_name="p_regen", metric_value=p_regen),
+            long_row(epoch=epoch, seed=seed, attack="train", metric_name="p_dist", metric_value=p_dist),
+            long_row(epoch=epoch, seed=seed, attack="train", metric_name="p_adv", metric_value=p_adv),
             long_row(epoch=epoch, seed=seed, attack="train", metric_name="wall_clock_s", metric_value=elapsed),
             long_row(
                 epoch=epoch,
@@ -433,9 +490,12 @@ def train(
 
         if logger:
             logger.log_metric_rows(long_rows)
+            bit = wide.get("bit_acc_clean")
+            bit_s = f" bit_clean={bit:.4f}" if bit is not None else ""
             logger.log(
                 f"epoch {epoch}: loss={wide['loss']:.4f} "
                 f"decode={wide['loss_decode']:.4f} perc={wide['loss_perc']:.4f} "
+                f"λ={lambda_perc:.3f} p_clean={wide['p_clean']:.2f}{bit_s} "
                 f"time={elapsed:.1f}s peak_mem={peak_mem / (1024**3):.3f}GB"
             )
 

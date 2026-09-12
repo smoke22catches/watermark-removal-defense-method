@@ -1,4 +1,4 @@
-"""Stochastic attack sampler over distortion / regen / PGD branches."""
+"""Stochastic attack sampler over clean / distortion / regen / PGD branches."""
 
 from __future__ import annotations
 
@@ -9,7 +9,11 @@ import torch.nn as nn
 
 
 class AttackSampler(nn.Module):
-    """Sample an attack from A_dist / A_regen / A_adv according to ``probs``."""
+    """Sample an attack from A_dist / A_regen / A_adv; remaining mass is clean.
+
+    ``probs`` is ``(p_dist, p_regen, p_adv)``. If the three sum to less than 1,
+    the residual probability is the clean (identity) branch — used for warm-start.
+    """
 
     def __init__(
         self,
@@ -25,10 +29,14 @@ class AttackSampler(nn.Module):
         self.distortion_bank = distortion_bank
         self.regen_proxy = regen_proxy
         self.decoder = decoder
-        self.probs = tuple(probs)  # p(dist), p(regen), p(adv) — відповідає 𝒜_dist, 𝒜_regen, 𝒜_adv з моделі
+        self.probs = tuple(probs)  # p(dist), p(regen), p(adv); residual → clean
         self.pgd_eps = pgd_eps
         self.pgd_alpha = pgd_alpha
         self.pgd_steps = pgd_steps
+
+    @property
+    def p_clean(self) -> float:
+        return max(0.0, 1.0 - sum(self.probs[:3]))
 
     def forward(
         self,
@@ -37,13 +45,13 @@ class AttackSampler(nn.Module):
         text_embeds: torch.Tensor,
     ) -> Tuple[torch.Tensor, str]:
         r = torch.rand(1).item()
-        if r < self.probs[0]:
+        p_dist, p_regen, p_adv = self.probs[0], self.probs[1], self.probs[2]
+        if r < p_dist:
             return self.distortion_bank(x_w), "dist"
-        elif r < self.probs[0] + self.probs[1]:
+        if r < p_dist + p_regen:
             return self.regen_proxy(x_w, text_embeds), "regen"
-        else:
-            # Marker only: train_step re-runs PGD outside no_grad so grads reach x_w.
-            # (Matching start.py comment: "PGD рахується окремо ... на живому графі".)
-            # Running PGD here under torch.no_grad() would raise RuntimeError.
+        if r < p_dist + p_regen + p_adv:
+            # Marker only: train_step re-runs PGD, then applies STE to x_w.
             _ = (m, self.decoder, self.pgd_eps, self.pgd_alpha, self.pgd_steps)
             return x_w.detach(), "adv"
+        return x_w, "clean"
