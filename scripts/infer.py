@@ -158,8 +158,16 @@ def _write_meta(run_dir: Path, cfg: dict, args: argparse.Namespace, extra: Dict[
         "checkpoint": args.checkpoint,
         "seed": int(cfg.get("seed", 42)),
         "protocol_version": PROTOCOL_VERSION,
-        "payload_bits": int(cfg.get("msg_len", info.get("payload_bits") or 0)),
-        "train_resolution": int(cfg.get("image_size", info.get("train_resolution") or 0)),
+        "payload_bits": (
+            int(cfg.get("msg_len", info.get("payload_bits") or 0))
+            if args.scheme == "ours"
+            else int(info.get("payload_bits") or cfg.get("msg_len") or 0)
+        ),
+        "train_resolution": (
+            int(cfg.get("image_size", info.get("train_resolution") or 0))
+            if args.scheme == "ours"
+            else int(info.get("train_resolution") or cfg.get("image_size") or 0)
+        ),
         "weights": info.get("weights"),
         "sweep_strengths": bool(args.sweep_strengths),
         "quality_only": bool(args.quality_only),

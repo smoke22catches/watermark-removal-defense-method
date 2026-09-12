@@ -19,7 +19,7 @@ from src.engine.train import export_algorithm_tex, train
 from src.models import Decoder, Encoder
 from src.utils.config import add_common_train_args, config_from_args
 from src.utils.logging import RunLogger, create_run_dir
-from src.utils.metrics import config_hash, dump_json, git_commit_hash, utc_now_iso
+from src.utils.metrics import PROTOCOL_VERSION, config_hash, dump_json, git_commit_hash, utc_now_iso
 from src.utils.seed import set_seed
 
 
@@ -65,6 +65,7 @@ def main() -> None:
         "msg_len": int(cfg.get("msg_len", 64)),
         "epochs": int(cfg.get("epochs", 100)),
         "scheme": "ours",
+        "protocol_version": PROTOCOL_VERSION,
         "hardware": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
     }
     dump_json(run_dir / "run_meta.json", meta)

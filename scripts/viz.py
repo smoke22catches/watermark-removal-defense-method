@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CLI wrapper: ``python scripts/viz.py --figure all --runs ... --out ...``."""
+"""Paper figure/table CLI: ``python scripts/viz.py --figure all --runs ... --out ...``."""
 
 from __future__ import annotations
 

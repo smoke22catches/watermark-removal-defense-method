@@ -24,7 +24,7 @@ from src.attacks.regeneration import (
     build_text_conditioner,
     make_text_embeds,
 )
-from src.attacks.sampler import AttackSampler
+from src.attacks.sampler import AttackSampler, curriculum_probs
 from src.engine.evaluate import evaluate_protocol
 from src.losses import PerceptualLoss, combined_loss
 from src.models import Decoder, Encoder
@@ -98,42 +98,8 @@ def train_step(
 
 
 def _curriculum_probs(epoch: int, cfg: Mapping[str, Any]) -> Tuple[float, float, float]:
-    """Return (p_dist, p_regen, p_adv); residual 1-sum is clean."""
-    cur = cfg.get("curriculum", {})
-    p_adv_default = float(cfg.get("attack_probs", [0.4, 0.4, 0.2])[2])
-    p_adv = float(cur.get("p_adv", 0.2)) if cur else p_adv_default
-    regen_branch = str(cfg.get("regen_branch", "ddim_proxy"))
-
-    if regen_branch == "none":
-        return max(0.0, 1.0 - p_adv), 0.0, p_adv
-
-    if not cur.get("enabled", True):
-        probs = cfg.get("attack_probs", [0.4, 0.4, 0.2])
-        return float(probs[0]), float(probs[1]), float(probs[2])
-
-    warm = int(cur.get("warm_start_epochs", 0))
-    if epoch < warm:
-        return 0.0, 0.0, 0.0
-
-    # Epochs after warm-start: ramp regen while keeping a clean floor.
-    t = epoch - warm
-    p_regen = min(
-        float(cur.get("p_regen_start", 0.1)) + float(cur.get("p_regen_step", 0.01)) * t,
-        float(cur.get("p_regen_max", 0.4)),
-    )
-    p_adv = float(cur.get("p_adv", 0.15))
-    p_dist_floor = float(cur.get("p_dist_floor", 0.2))
-    p_clean_floor = float(cur.get("p_clean_floor", 0.2))
-
-    # Allocate: clean floor + adv + regen, remainder → dist (at least p_dist_floor).
-    p_dist = max(p_dist_floor, 1.0 - p_regen - p_adv - p_clean_floor)
-    # Renormalize if over-allocated.
-    total = p_dist + p_regen + p_adv
-    max_attack = 1.0 - p_clean_floor
-    if total > max_attack and total > 0:
-        scale = max_attack / total
-        p_dist, p_regen, p_adv = p_dist * scale, p_regen * scale, p_adv * scale
-    return p_dist, p_regen, p_adv
+    """Thin wrapper so Algorithm 1 export and the loop share one implementation."""
+    return curriculum_probs(epoch, cfg)
 
 
 def _lambda_perc_for_epoch(epoch: int, cfg: Mapping[str, Any]) -> float:
@@ -186,7 +152,12 @@ def _build_regen_branch(
 
 
 def export_algorithm_tex(config: Mapping[str, Any], path: str | Path) -> Path:
-    """Emit a LaTeX algorithm/algorithmic block from the *resolved* config and loop."""
+    """Emit a LaTeX algorithm/algorithmic block from the *resolved* config and loop.
+
+    Curriculum arithmetic is taken from :func:`_curriculum_probs` (same defaults,
+    same warm-start / clean-floor / rescale) so the published pseudocode cannot
+    drift from ``train()`` / ``train_step``.
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     epochs = int(config.get("epochs", 100))
@@ -203,15 +174,24 @@ def export_algorithm_tex(config: Mapping[str, Any], path: str | Path) -> Path:
     cur_on = bool(cur.get("enabled", True))
     p0 = float(cur.get("p_regen_start", 0.1))
     dp = float(cur.get("p_regen_step", 0.01))
-    pmax = float(cur.get("p_regen_max", 0.5))
+    pmax = float(cur.get("p_regen_max", 0.4))
     p_floor = float(cur.get("p_dist_floor", 0.2))
-    p_adv = float(cur.get("p_adv", probs[2] if len(probs) > 2 else 0.2))
+    p_clean_floor = float(cur.get("p_clean_floor", 0.2))
+    p_adv = float(cur.get("p_adv", 0.15 if cur else (probs[2] if len(probs) > 2 else 0.2)))
+    warm = int(cur.get("warm_start_epochs", 0))
     n_steps = int(regen.get("n_steps", 4))
     t_start = float(regen.get("t_start", 0.3))
     eps = float(pgd.get("eps", 0.02))
     alpha = float(pgd.get("alpha", 0.005))
     pgd_steps = int(pgd.get("steps", 5))
     image_size = int(config.get("image_size", 128))
+    warm_lp = cur.get("warm_lambda_perc")
+    lam_warm = float(warm_lp) if warm_lp is not None else lam
+
+    # Numeric snapshot from the same function the loop calls.
+    p_e0 = _curriculum_probs(0, config)
+    p_end = _curriculum_probs(max(epochs - 1, 0), config)
+    p_post = _curriculum_probs(warm, config) if warm > 0 else p_e0
 
     if branch == "ddim_proxy":
         regen_line = (
@@ -219,55 +199,87 @@ def export_algorithm_tex(config: Mapping[str, Any], path: str | Path) -> Path:
             f"(x_w; n_{{\\mathrm{{steps}}}}={n_steps}, t_{{\\mathrm{{start}}}}={t_start})$"
         )
     elif branch == "blur_surrogate":
-        regen_line = r"        \STATE $x' \gets \mathrm{GaussianBlur}(x_w)$ \COMMENT{matched L2 budget}"
+        sigma = regen.get("blur_sigma")
+        sigma_note = f", $\\sigma={float(sigma):.3f}$" if sigma else ", matched L2 budget"
+        regen_line = (
+            r"        \STATE $x' \gets \mathrm{GaussianBlur}(x_w)$ "
+            f"\\COMMENT{{VINE-style surrogate{sigma_note}}}"
+        )
     else:
         regen_line = r"        \STATE $x' \gets x_w$ \COMMENT{regen branch disabled}"
 
-    if cur_on and branch != "none":
-        curr_block = f"""  \\STATE Update curriculum:
-  \\STATE \\quad $p_{{\\mathrm{{regen}}}} \\gets \\min({p0} + {dp}\\cdot e,\\ {pmax})$
-  \\STATE \\quad $p_{{\\mathrm{{dist}}}} \\gets \\max(0.5 - p_{{\\mathrm{{regen}}}},\\ {p_floor})$
-  \\STATE \\quad $p_{{\\mathrm{{adv}}}} \\gets {p_adv}$"""
-    elif branch == "none":
-        curr_block = f"""  \\STATE Regen branch disabled: $p_{{\\mathrm{{regen}}}} \\gets 0$,
-  \\STATE \\quad $p_{{\\mathrm{{adv}}}} \\gets {p_adv}$,\\ $p_{{\\mathrm{{dist}}}} \\gets 1-p_{{\\mathrm{{adv}}}}$"""
-    else:
+    if branch == "none":
+        curr_block = (
+            f"  \\STATE Regen branch disabled: "
+            f"$p_{{\\mathrm{{regen}}}}\\gets 0$, "
+            f"$p_{{\\mathrm{{adv}}}}\\gets {p_adv}$, "
+            f"$p_{{\\mathrm{{dist}}}}\\gets 1-p_{{\\mathrm{{adv}}}}$"
+        )
+    elif not cur_on:
         curr_block = (
             f"  \\STATE Fixed attack probabilities "
             f"$({probs[0]}, {probs[1]}, {probs[2]})$ "
-            r"for $(\mathcal{A}_{\mathrm{dist}}, \mathcal{A}_{\mathrm{regen}}, \mathcal{A}_{\mathrm{adv}})$"
+            r"for $(\mathcal{A}_{\mathrm{dist}}, \mathcal{A}_{\mathrm{regen}}, \mathcal{A}_{\mathrm{adv}})$; "
+            f"residual $p_{{\\mathrm{{clean}}}}=1-\\sum p$"
         )
+    else:
+        curr_block = f"""  \\IF{{$e < {warm}$}}
+    \\STATE $p_{{\\mathrm{{dist}}}}, p_{{\\mathrm{{regen}}}}, p_{{\\mathrm{{adv}}}} \\gets 0$
+    \\COMMENT{{clean warm-start; $\\lambda_{{\\mathrm{{perc}}}}={lam_warm}$}}
+  \\ELSE
+    \\STATE $t \\gets e - {warm}$
+    \\STATE $p_{{\\mathrm{{regen}}}} \\gets \\min({p0} + {dp}\\cdot t,\\ {pmax})$
+    \\STATE $p_{{\\mathrm{{adv}}}} \\gets {p_adv}$
+    \\STATE $p_{{\\mathrm{{dist}}}} \\gets \\max({p_floor},\\ 1 - p_{{\\mathrm{{regen}}}} - p_{{\\mathrm{{adv}}}} - {p_clean_floor})$
+    \\STATE $p_{{\\mathrm{{clean}}}} \\gets {p_clean_floor}$ \\COMMENT{{clean floor}}
+    \\IF{{$p_{{\\mathrm{{dist}}}}+p_{{\\mathrm{{regen}}}}+p_{{\\mathrm{{adv}}}} > 1-{p_clean_floor}$}}
+      \\STATE rescale $(p_{{\\mathrm{{dist}}}}, p_{{\\mathrm{{regen}}}}, p_{{\\mathrm{{adv}}}})$ to sum $1-{p_clean_floor}$
+    \\ENDIF
+    \\STATE $\\lambda_{{\\mathrm{{perc}}}} \\gets {lam}$
+  \\ENDIF"""
 
-    tex = f"""% Auto-generated from the resolved training config and loop. Do not edit by hand.
+    branch_tex = branch.replace("_", r"\_")
+    p0s = ", ".join(f"{v:.3f}" for v in p_e0)
+    pends = ", ".join(f"{v:.3f}" for v in p_end)
+    pposts = ", ".join(f"{v:.3f}" for v in p_post)
+
+    tex = f"""% Auto-generated from src.engine.train.train / train_step / _curriculum_probs.
+% Do not edit by hand — re-run with --export-algorithm.
+% Resolved (p_dist, p_regen, p_adv): e=0 -> ({p0s}); after warm-start e={warm} -> ({pposts}); e={epochs - 1} -> ({pends}).
 \\begin{{algorithm}}[t]
 \\caption{{Навчання запропонованого методу (мінімакс із навчальним планом)}}
 \\label{{alg:train}}
 \\begin{{algorithmic}}[1]
 \\REQUIRE Cover dataset, epochs $E={epochs}$, payload $L={msg_len}$\\,bit, image size ${image_size}$,
          batch ${batch}$, Adam $\\eta={lr}$, $\\lambda_{{\\mathrm{{perc}}}}={lam}$,
-         regen-branch $\\mathtt{{{branch.replace("_", r"\\_")}}}$, PGD $(\\varepsilon={eps},\\ \\alpha={alpha},\\ T={pgd_steps})$
+         regen-branch $\\mathtt{{{branch_tex}}}$, PGD $(\\varepsilon={eps},\\ \\alpha={alpha},\\ T={pgd_steps})$
 \\ENSURE Encoder $E_\\theta$, Decoder $D_\\phi$
 \\FOR{{$e = 0$ \\TO ${epochs - 1}$}}
 {curr_block}
   \\FOR{{each minibatch $x$}}
     \\STATE Sample message $m \\sim \\mathrm{{Bernoulli}}(1/2)^{{L}}$
     \\STATE $x_w \\gets E_\\theta(x, m)$ \\COMMENT{{leader: embed}}
-    \\STATE Sample attack type from $\\{{dist, regen, adv\\}}$ with $(p_{{\\mathrm{{dist}}}}, p_{{\\mathrm{{regen}}}}, p_{{\\mathrm{{adv}}}})$
+    \\STATE Sample type $\\in\\{{dist, regen, adv, clean\\}}$ with $(p_{{\\mathrm{{dist}}}}, p_{{\\mathrm{{regen}}}}, p_{{\\mathrm{{adv}}}})$; residual $\\to$ clean
     \\IF{{type $=$ dist}}
       \\STATE $x' \\gets \\mathrm{{DistortionBank}}(x_w)$ \\COMMENT{{JPEG / noise / downsample}}
     \\ELSIF{{type $=$ regen}}
 {regen_line}
-    \\ELSE
+    \\ELSIF{{type $=$ adv}}
       \\STATE $x' \\gets \\mathrm{{PGD}}_{{D_\\phi}}(x_w, m; \\varepsilon={eps}, \\alpha={alpha}, T={pgd_steps})$
-      \\COMMENT{{follower; gradient reaches $x_w$}}
+      \\COMMENT{{follower}}
+    \\ELSE
+      \\STATE $x' \\gets x_w$
+    \\ENDIF
+    \\IF{{type $\\neq$ clean}}
+      \\STATE $x' \\gets x' + \\mathrm{{sg}}(x_w) - \\mathrm{{sg}}(x')$ \\COMMENT{{straight-through: forward $x'$, backward $\\partial/\\partial x_w$}}
     \\ENDIF
     \\STATE $\\hat{{z}} \\gets D_\\phi(x')$
-    \\STATE $\\mathcal{{L}} \\gets \\mathcal{{L}}_{{\\mathrm{{dec}}}}(\\hat{{z}}, m) + {lam}\\,\\mathcal{{L}}_{{\\mathrm{{perc}}}}(x_w, x)$
+    \\STATE $\\mathcal{{L}} \\gets \\mathcal{{L}}_{{\\mathrm{{dec}}}}(\\hat{{z}}, m) + \\lambda_{{\\mathrm{{perc}}}}\\,\\mathcal{{L}}_{{\\mathrm{{perc}}}}(x_w, x)$
     \\STATE Adam update of $\\theta, \\phi$ on $\\nabla \\mathcal{{L}}$
     \\COMMENT{{minimax cadence: one follower attack then one leader step per batch}}
   \\ENDFOR
-  \\IF{{$e \\bmod {val_every} = 0$}}
-    \\STATE Validate bit accuracy and PSNR/SSIM/LPIPS per attack
+  \\IF{{$e \\bmod {val_every} = 0$ \\OR $e = {epochs - 1}$}}
+    \\STATE Validate bit accuracy and PSNR/SSIM/LPIPS per attack (attacked vs cover)
   \\ENDIF
 \\ENDFOR
 \\end{{algorithmic}}
@@ -315,6 +327,13 @@ def train(
     local_files_only = bool(regen_cfg.get("local_files_only", False))
 
     regen_proxy = _build_regen_branch(config, device)
+    if isinstance(regen_proxy, GaussianBlurSurrogate) and isinstance(config, dict):
+        config.setdefault("regen", {})
+        config["regen"]["blur_sigma"] = float(regen_proxy.sigma)
+        if run_dir is not None:
+            from src.utils.logging import save_config
+
+            save_config(config, Path(run_dir) / "config.yaml")
 
     text_conditioner = build_text_conditioner(
         use_real_text_embeds=bool(regen_cfg.get("use_real_text_embeds", False)),

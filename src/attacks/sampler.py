@@ -2,10 +2,50 @@
 
 from __future__ import annotations
 
-from typing import Sequence, Tuple
+from typing import Any, Mapping, Sequence, Tuple
 
 import torch
 import torch.nn as nn
+
+
+def curriculum_probs(epoch: int, cfg: Mapping[str, Any]) -> Tuple[float, float, float]:
+    """Return ``(p_dist, p_regen, p_adv)``; residual ``1-sum`` is clean.
+
+    Shared by the training loop, Algorithm 1 export, and figure B1 so the
+    published probabilities cannot drift from the code.
+    """
+    cur = cfg.get("curriculum", {})
+    p_adv_default = float(cfg.get("attack_probs", [0.4, 0.4, 0.2])[2])
+    p_adv = float(cur.get("p_adv", 0.2)) if cur else p_adv_default
+    regen_branch = str(cfg.get("regen_branch", "ddim_proxy"))
+
+    if regen_branch == "none":
+        return max(0.0, 1.0 - p_adv), 0.0, p_adv
+
+    if not cur.get("enabled", True):
+        probs = cfg.get("attack_probs", [0.4, 0.4, 0.2])
+        return float(probs[0]), float(probs[1]), float(probs[2])
+
+    warm = int(cur.get("warm_start_epochs", 0))
+    if epoch < warm:
+        return 0.0, 0.0, 0.0
+
+    t = epoch - warm
+    p_regen = min(
+        float(cur.get("p_regen_start", 0.1)) + float(cur.get("p_regen_step", 0.01)) * t,
+        float(cur.get("p_regen_max", 0.4)),
+    )
+    p_adv = float(cur.get("p_adv", 0.15))
+    p_dist_floor = float(cur.get("p_dist_floor", 0.2))
+    p_clean_floor = float(cur.get("p_clean_floor", 0.2))
+
+    p_dist = max(p_dist_floor, 1.0 - p_regen - p_adv - p_clean_floor)
+    total = p_dist + p_regen + p_adv
+    max_attack = 1.0 - p_clean_floor
+    if total > max_attack and total > 0:
+        scale = max_attack / total
+        p_dist, p_regen, p_adv = p_dist * scale, p_regen * scale, p_adv * scale
+    return p_dist, p_regen, p_adv
 
 
 class AttackSampler(nn.Module):

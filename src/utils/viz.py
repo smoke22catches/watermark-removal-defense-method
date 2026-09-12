@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import textwrap
 import warnings
 from datetime import datetime, timezone
 from pathlib import Path
@@ -37,6 +38,7 @@ from src.attacks.registry import (
     SCHEME_ORDER,
     get_attack,
 )
+from src.attacks.sampler import curriculum_probs
 from src.data.datasets import load_manifest
 from src.utils.metrics import (
     NOT_EVALUATED,
@@ -148,6 +150,17 @@ D1_COLUMNS = (
 )
 MIN_SEEDS = 3
 FIGURE_IDS = ("d4", "c3", "g1", "f2", "b1", "d1", "e1", "c1", "c2", "h1")
+F2_IGNORE = {
+    "run_name",
+    "seed",
+    "resume",
+    "device",
+    "runs_root",
+    "export_algorithm",
+    "num_workers",
+    "regen_branch",
+    "blur_sigma",
+}
 
 
 def configure_style() -> None:
@@ -419,10 +432,30 @@ def load_runs(paths: Sequence[Path | str]) -> List[RunBundle]:
 
 
 def _eval_frame(runs: Sequence[RunBundle]) -> pd.DataFrame:
-    """Concatenate results.csv (preferred) or validation rows of metrics.csv."""
-    frames: List[pd.DataFrame] = []
+    """Concatenate evaluation rows, one run per (scheme, seed, regen_branch).
+
+    Prefer ``results.csv`` (eval protocol) over training ``metrics.csv`` so the
+    two are never averaged together for the same identity.
+    """
+    chosen: Dict[Tuple[Any, ...], RunBundle] = {}
     for r in runs:
-        src = r.results if r.results is not None else r.metrics
+        key = (r.scheme, str(r.seed), str(r.meta.get("regen_branch", r.config.get("regen_branch", ""))))
+        has_res = r.results is not None and not r.results.empty
+        prev = chosen.get(key)
+        if prev is None:
+            chosen[key] = r
+        else:
+            prev_res = prev.results is not None and not prev.results.empty
+            if has_res and not prev_res:
+                chosen[key] = r
+            elif has_res and prev_res:
+                n_new = int(r.results["attack"].nunique()) if "attack" in r.results.columns else 0
+                n_old = int(prev.results["attack"].nunique()) if "attack" in prev.results.columns else 0
+                if n_new > n_old:
+                    chosen[key] = r
+    frames: List[pd.DataFrame] = []
+    for r in chosen.values():
+        src = r.results if (r.results is not None and not r.results.empty) else r.metrics
         if src is None or src.empty:
             continue
         df = src.copy()
@@ -505,6 +538,8 @@ def _write_table(
     headers: Sequence[str],
     rows: Sequence[Sequence[str]],
     colspec: Optional[str] = None,
+    title: Optional[str] = None,
+    also_figure: bool = True,
 ) -> Dict[str, str]:
     out_dir.mkdir(parents=True, exist_ok=True)
     csv_path = out_dir / f"{fig_id}.csv"
@@ -512,6 +547,7 @@ def _write_table(
     pd.DataFrame(list(rows), columns=list(headers)).to_csv(csv_path, index=False, encoding="utf-8")
     spec = colspec or ("l" + "c" * (len(headers) - 1))
     lines = [
+        r"% Requires \usepackage{booktabs}",
         r"\begin{table}[t]",
         r"\centering",
         r"\input{" + f"{fig_id}_caption.tex" + "}",
@@ -521,10 +557,76 @@ def _write_table(
         r"\midrule",
     ]
     for row in rows:
-        lines.append(" & ".join(row) + r" \\")
+        lines.append(" & ".join(str(c) for c in row) + r" \\")
     lines += [r"\bottomrule", r"\end{tabular}", r"\end{table}", ""]
     tex_path.write_text("\n".join(lines), encoding="utf-8")
-    return {"csv": str(csv_path), "tex": str(tex_path)}
+    artifacts: Dict[str, str] = {"csv": str(csv_path), "tex": str(tex_path)}
+    if also_figure:
+        artifacts.update(
+            _render_table_figure(headers, rows, out_dir, fig_id, title or fig_id.upper())
+        )
+    return artifacts
+
+
+def _render_table_figure(
+    headers: Sequence[str],
+    rows: Sequence[Sequence[str]],
+    out_dir: Path,
+    fig_id: str,
+    title: str,
+) -> Dict[str, str]:
+    """Raster/vector rendering of a booktabs table so Cyrillic can be inspected."""
+    configure_style()
+    n_rows = max(len(rows), 1)
+    n_cols = max(len(headers), 1)
+    wrap_w = 28 if n_cols <= 3 else max(10, int(96 / n_cols))
+    fig_w = min(14.0, max(7.0, 1.45 * n_cols))
+    fig_h = min(18.0, max(2.8, 0.52 * (n_rows + 4)))
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    ax.axis("off")
+    ax.set_title(title, fontsize=10, pad=10)
+    cell = [[_wrap_cell(c, wrap_w) for c in row] for row in rows] or [[UK["not_eval"]] * n_cols]
+    col_lab = [_wrap_cell(h, wrap_w) for h in headers]
+    table = ax.table(
+        cellText=cell,
+        colLabels=col_lab,
+        loc="center",
+        cellLoc="center",
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(6.5 if n_cols < 8 else 5.8)
+    table.scale(1.0, 1.55)
+    try:
+        table.auto_set_column_width(col=list(range(n_cols)))
+    except Exception:
+        pass
+    for (r, _c), cell_obj in table.get_celld().items():
+        if r == 0:
+            cell_obj.set_facecolor("#dceaf7")
+            cell_obj.set_text_props(fontweight="bold")
+        cell_obj.set_edgecolor("#888")
+    fig.tight_layout()
+    return _save_fig(fig, out_dir, fig_id)
+
+
+def _strip_tex(s: Any) -> str:
+    t = str(s)
+    t = t.replace(r"${\pm}$", "±").replace(r"$\pm$", "±")
+    t = t.replace(r"$\lambda_{\mathrm{perc}}$", "λ_perc")
+    t = t.replace(r"\lambda_{\mathrm{perc}}", "λ_perc")
+    t = t.replace(r"PGD $(\varepsilon, \alpha, T)$", "PGD (ε, α, T)")
+    t = t.replace(r"$\varepsilon$", "ε").replace(r"$\delta$", "δ")
+    t = t.replace(r"\textbf{", "").replace(r"\_", "_")
+    t = t.replace(r"\mathrm{", "")
+    t = t.replace("{", "").replace("}", "").replace("$", "")
+    return t
+
+
+def _wrap_cell(s: Any, width: int) -> str:
+    t = _strip_tex(s)
+    if width < 4 or len(t) <= width:
+        return t
+    return "\n".join(textwrap.wrap(t, width=width, break_long_words=True) or [t])
 
 
 def _fmt_ci(mean: float, half: float, n: int) -> str:
@@ -564,6 +666,27 @@ def _attack_class(attack_id: str) -> str:
         if attack_id in CLASS_LABEL_UK:
             return str(attack_id)
         return "regen"
+
+
+def _is_number(v: Any) -> bool:
+    try:
+        return np.isfinite(float(v))
+    except (TypeError, ValueError):
+        return False
+
+
+def _normalized_rank(attack_id: str, strength: Any) -> float:
+    """Map a registry strength to [0, 1] (weak → strong) for D4 aggregation."""
+    try:
+        spec = get_attack("unseen_blur" if attack_id == "unseen" else str(attack_id))
+        sts = [float(s) for s in spec.strengths]
+        if len(sts) <= 1 or not _is_number(strength):
+            return 0.5 if sts else 0.0
+        sv = float(strength)
+        i = min(range(len(sts)), key=lambda j: abs(sts[j] - sv))
+        return i / (len(sts) - 1)
+    except Exception:
+        return 0.5
 
 
 def _quality_degradation(row_acc: pd.Series, refs: Mapping[str, float], x_axis: str) -> float:
@@ -662,37 +785,43 @@ def generate_d4(
                 for m in ("psnr", "ssim", "lpips"):
                     if m in clean.columns and clean[m].notna().any():
                         refs[m] = float(clean[m].mean())
-            # Mean over seeds per (attack, strength)
-            grp_cols = [c for c in ("attack", "strength") if c in sub.columns]
+            ranked = sub.copy()
+            ranked["rank"] = [
+                _normalized_rank(str(a), s)
+                for a, s in zip(ranked["attack"], ranked["strength"] if "strength" in ranked.columns else [""] * len(ranked))
+            ]
+            ranked["rank_key"] = (ranked["rank"] * 4).round() / 4.0
+            ranked["qdeg"] = ranked.apply(lambda row: _quality_degradation(row, refs, x_axis), axis=1)
             points = []
-            for _, g in sub.groupby(grp_cols, dropna=False):
-                y_m, y_h, n = mean_ci95(g["bit_accuracy"].tolist())
-                g2 = g.copy()
-                g2["qdeg"] = g2.apply(lambda row: _quality_degradation(row, refs, x_axis), axis=1)
-                x_m, x_h, _ = mean_ci95(g2["qdeg"].tolist())
-                strength = g["strength"].iloc[0] if "strength" in g.columns else ""
-                attack = str(g["attack"].iloc[0])
-                points.append((x_m, y_m, y_h, n, strength, attack))
+            for rank, g in ranked.groupby("rank_key"):
+                seed_y, seed_x = [], []
+                for _, sg in g.groupby("seed"):
+                    seed_y.append(float(sg["bit_accuracy"].mean()))
+                    seed_x.append(float(sg["qdeg"].mean()))
+                y_m, y_h, n = mean_ci95(seed_y)
+                x_m, _, _ = mean_ci95(seed_x)
+                points.append((x_m, y_m, y_h, n, rank))
             points = [p for p in points if np.isfinite(p[0]) and np.isfinite(p[1])]
-            points.sort(key=lambda p: (p[0], str(p[4])))
+            points.sort(key=lambda p: (p[4], p[0]))
             if not points:
                 continue
-            xs = [p[0] for p in points]
-            ys = [p[1] for p in points]
-            yerr = [p[2] if np.isfinite(p[2]) else 0.0 for p in points]
+            xs = np.array([p[0] for p in points], dtype=float)
+            ys = np.array([p[1] for p in points], dtype=float)
+            yerr = np.array([p[2] if np.isfinite(p[2]) else 0.0 for p in points], dtype=float)
+            order = np.argsort(xs, kind="mergesort")
             ax.plot(xs, ys, color=st["color"], ls=st["ls"], marker=st["marker"],
                     label=_scheme_label(scheme), markersize=4)
             ax.fill_between(
-                xs,
-                np.array(ys) - np.array(yerr),
-                np.array(ys) + np.array(yerr),
+                xs[order],
+                ys[order] - yerr[order],
+                ys[order] + yerr[order],
                 color=st["color"],
                 alpha=0.15,
                 linewidth=0,
             )
-            for x, y, _, _, strength, attack in points:
+            for x, y, _, _, rank in points:
                 ax.annotate(
-                    f"{strength}",
+                    f"{rank:g}",
                     (x, y),
                     textcoords="offset points",
                     xytext=(0, 5),
@@ -770,7 +899,10 @@ def generate_c3(runs: Sequence[RunBundle], out_dir: Path, **_: Any) -> Dict[str,
                 spec.seen_in_training,
             ]
         )
-    artifacts = _write_table(out_dir, "c3", headers, rows, colspec="lllp{3.2cm}cccc")
+    artifacts = _write_table(
+        out_dir, "c3", headers, rows, colspec="lllp{3.2cm}cccc",
+        title="Єдиний протокол оцінювання",
+    )
     # overwrite csv with machine-readable ids
     pd.DataFrame(csv_rows, columns=csv_headers).to_csv(out_dir / "c3.csv", index=False, encoding="utf-8")
     n = _n_seeds(_eval_frame(runs)) if runs else 0
@@ -889,13 +1021,13 @@ def generate_g1(runs: Sequence[RunBundle], out_dir: Path, **_: Any) -> Dict[str,
             color=colors, error_kw={"elinewidth": 0.8, "capsize": 2})
     ax2.set_xticks(np.arange(len(SCHEME_ORDER)))
     ax2.set_xticklabels(drop_labels, rotation=30, ha="right")
-    ax2.set_title("Спад seen→unseen")
+    ax2.set_title("Спад: відомі → невідомі")
     ax2.set_ylabel(UK["decoding_accuracy"])
     ax2.grid(True, axis="y", alpha=0.3)
 
     fig.tight_layout()
     artifacts = _save_fig(fig, out_dir, "g1")
-    artifacts.update(_write_table(out_dir, "g1", table_headers, table_rows))
+    artifacts.update(_write_table(out_dir, "g1", table_headers, table_rows, also_figure=False))
     datasets = sorted({r.dataset for r in runs if r.dataset})
     cap = (
         f"\\caption{{Результати на невідомих (відкладених) атаках. "
@@ -910,10 +1042,7 @@ def generate_g1(runs: Sequence[RunBundle], out_dir: Path, **_: Any) -> Dict[str,
 
 
 def _config_diff(a: Mapping[str, Any], b: Mapping[str, Any]) -> List[str]:
-    ignore = {
-        "run_name", "seed", "resume", "device", "runs_root", "export_algorithm",
-        "num_workers", "regen_branch",
-    }
+    ignore = F2_IGNORE
     ca, cb = canonical_config(a, ignore=ignore), canonical_config(b, ignore=ignore)
 
     def _walk(x, y, prefix=""):
@@ -951,15 +1080,9 @@ def generate_f2(runs: Sequence[RunBundle], out_dir: Path, **_: Any) -> Dict[str,
                 + "\n  ".join(diffs)
             )
         for group in by_branch.values():
-            ref = canonical_config(group[0].config, ignore={
-                "run_name", "seed", "resume", "device", "runs_root",
-                "export_algorithm", "num_workers", "regen_branch",
-            })
+            ref = canonical_config(group[0].config, ignore=F2_IGNORE)
             for r in group[1:]:
-                other = canonical_config(r.config, ignore={
-                    "run_name", "seed", "resume", "device", "runs_root",
-                    "export_algorithm", "num_workers", "regen_branch",
-                })
+                other = canonical_config(r.config, ignore=F2_IGNORE)
                 if other != ref:
                     raise SystemExit(f"F2 abort: intra-branch config mismatch in {r.path}")
 
@@ -977,14 +1100,15 @@ def generate_f2(runs: Sequence[RunBundle], out_dir: Path, **_: Any) -> Dict[str,
         (axes[0], True, UK["seen"]),
         (axes[1], False, UK["unseen"]),
     ):
-        vals_map: Dict[str, List[float]] = {"ddim_proxy": [], "blur_surrogate": []}
+        vals_by_seed: Dict[str, Dict[Any, float]] = {"ddim_proxy": {}, "blur_surrogate": {}}
         if not wide.empty and "bit_accuracy" in wide.columns:
             flag_series = wide["seen_flag"].astype(str).str.lower().isin(["true", "1", "yes"])
             panel = wide[(flag_series if seen_flag else ~flag_series) & (wide["attack"] != "clean")]
-            for branch in vals_map:
+            for branch in vals_by_seed:
                 sub = panel[panel["regen_branch"] == branch]
-                for _, g in sub.groupby("seed"):
-                    vals_map[branch].append(float(g["bit_accuracy"].mean()))
+                for seed, g in sub.groupby("seed"):
+                    vals_by_seed[branch][seed] = float(g["bit_accuracy"].mean())
+        vals_map = {b: list(vals_by_seed[b].values()) for b in vals_by_seed}
         xs = np.arange(2)
         means, errs = [], []
         for i, branch in enumerate(("ddim_proxy", "blur_surrogate")):
@@ -1008,12 +1132,12 @@ def generate_f2(runs: Sequence[RunBundle], out_dir: Path, **_: Any) -> Dict[str,
         if seen_flag:
             ax.set_ylabel(UK["bit_accuracy"])
 
-        ddim, blur = vals_map["ddim_proxy"], vals_map["blur_surrogate"]
-        n_pair = min(len(ddim), len(blur))
-        diffs = [ddim[i] - blur[i] for i in range(n_pair)] if n_pair else []
+        ddim_s, blur_s = vals_by_seed["ddim_proxy"], vals_by_seed["blur_surrogate"]
+        common = sorted(set(ddim_s) & set(blur_s), key=lambda s: str(s))
+        diffs = [ddim_s[s] - blur_s[s] for s in common]
         md, hd, nd = mean_ci95(diffs)
-        m0, h0, n0 = mean_ci95(ddim)
-        m1, h1, n1 = mean_ci95(blur)
+        m0, h0, n0 = mean_ci95(list(ddim_s.values()))
+        m1, h1, n1 = mean_ci95(list(blur_s.values()))
         rows.append([
             title,
             _fmt_ci(m0, h0, n0),
@@ -1023,7 +1147,7 @@ def generate_f2(runs: Sequence[RunBundle], out_dir: Path, **_: Any) -> Dict[str,
 
     fig.tight_layout()
     artifacts = _save_fig(fig, out_dir, "f2")
-    artifacts.update(_write_table(out_dir, "f2", headers, rows))
+    artifacts.update(_write_table(out_dir, "f2", headers, rows, also_figure=False))
     datasets = sorted({r.dataset for r in runs if r.dataset})
     cap = (
         f"\\caption{{Абляція навчальної гілки регенерації: DDIM-проксі проти розмиття-сурогату "
@@ -1043,11 +1167,8 @@ def generate_b1(runs: Sequence[RunBundle], out_dir: Path, **_: Any) -> Dict[str,
     """Architecture / gradient-flow schematic from the resolved config."""
     configure_style()
     cfg = runs[0].config if runs else {}
-    cur = cfg.get("curriculum", {})
-    probs = list(cfg.get("attack_probs", [0.4, 0.4, 0.2]))
-    p_adv = float(cur.get("p_adv", probs[2] if len(probs) > 2 else 0.2))
-    p_regen = float(cur.get("p_regen_max", probs[1] if len(probs) > 1 else 0.4))
-    p_dist = max(0.5 - p_regen, float(cur.get("p_dist_floor", 0.2)))
+    p_dist, p_regen, p_adv = curriculum_probs(10**9, cfg)
+    p_dist, p_regen, p_adv = curriculum_probs(10**9, cfg)
     branch = str(cfg.get("regen_branch", "ddim_proxy"))
     lam = float(cfg.get("lambda_perc", 1.0))
     n_steps = int(cfg.get("regen", {}).get("n_steps", 4))
@@ -1197,7 +1318,7 @@ def generate_d1(runs: Sequence[RunBundle], out_dir: Path, **_: Any) -> Dict[str,
             row.append(_fmt_ci_tex(m, h, n, bold=(best[cls] == scheme and n > 0)))
         body.append(row)
 
-    artifacts = _write_table(out_dir, "d1", headers, body)
+    artifacts = _write_table(out_dir, "d1", headers, body, title="Порівняння схем за класами атак")
     datasets = sorted({r.dataset for r in runs if r.dataset})
     cap = (
         f"\\caption{{Порівняння схем за класами атак (геометричні дисторсії — окрема колонка). "
@@ -1232,9 +1353,17 @@ def generate_e1(runs: Sequence[RunBundle], out_dir: Path, **_: Any) -> Dict[str,
     payload_map = {}
     for r in runs:
         info = SCHEME_INFO.get(r.scheme, {})
-        payload_map[r.scheme] = int(
-            r.config.get("msg_len") or r.meta.get("payload_bits") or info.get("payload_bits") or 0
-        )
+        if r.scheme == "ours":
+            payload_map[r.scheme] = int(
+                r.config.get("msg_len") or r.meta.get("payload_bits") or 0
+            )
+        else:
+            payload_map[r.scheme] = int(
+                info.get("payload_bits")
+                or r.meta.get("payload_bits")
+                or r.config.get("msg_len")
+                or 0
+            )
     schemes = list(SCHEME_ORDER)
     datasets = sorted({r.dataset for r in runs if r.dataset}) or [""]
     for scheme in schemes:
@@ -1250,7 +1379,9 @@ def generate_e1(runs: Sequence[RunBundle], out_dir: Path, **_: Any) -> Dict[str,
                 m, h, n = mean_ci95(vals)
                 return _fmt_ci(m, h, n)
 
-            bits = payload_map.get(scheme, SCHEME_INFO.get(scheme, {}).get("payload_bits") or UK["not_eval"])
+            bits = payload_map.get(scheme)
+            if not bits:
+                bits = SCHEME_INFO.get(scheme, {}).get("payload_bits") or UK["not_eval"]
             rows.append(
                 [
                     _scheme_label(scheme),
@@ -1262,7 +1393,7 @@ def generate_e1(runs: Sequence[RunBundle], out_dir: Path, **_: Any) -> Dict[str,
                     _col("fid"),
                 ]
             )
-    artifacts = _write_table(out_dir, "e1", headers, rows)
+    artifacts = _write_table(out_dir, "e1", headers, rows, title="Якість зображення з водяним знаком")
     cap = (
         f"\\caption{{Якість зображення з водяним знаком відносно обкладинки (без атаки). "
         f"{UK['mean_ci']}, $n={n_seeds}$ {UK['seeds']}. "
@@ -1351,7 +1482,7 @@ def generate_c1(runs: Sequence[RunBundle], out_dir: Path, **_: Any) -> Dict[str,
             )
     if not rows:
         rows.append([UK["not_eval"]] * 6)
-    artifacts = _write_table(out_dir, "c1", headers, rows)
+    artifacts = _write_table(out_dir, "c1", headers, rows, title="Набори даних")
     cap = (
         f"\\caption{{Набори даних. Навчання і оцінювання використовують різні спліти "
         f"(колонка «Роль»). Джерело — маніфест \\texttt{{data/manifest.json}} та конфіг запуску.}}"
@@ -1372,8 +1503,8 @@ def generate_c2(runs: Sequence[RunBundle], out_dir: Path, **_: Any) -> Dict[str,
     hw = meta.get("hardware") or ("cuda" if torch.cuda.is_available() else "cpu")
     items = [
         ("Оптимізатор", "Adam"),
-        ("Learning rate", str(cfg.get("lr", ""))),
-        ("Batch size", str(cfg.get("batch_size", ""))),
+        ("Швидкість навчання", str(cfg.get("lr", ""))),
+        ("Розмір батча", str(cfg.get("batch_size", ""))),
         (UK["epoch"], str(cfg.get("epochs", ""))),
         (UK["payload"], str(cfg.get("msg_len", meta.get("payload_bits", "")))),
         ("Роздільність", str(cfg.get("image_size", meta.get("train_resolution", "")))),
@@ -1386,12 +1517,12 @@ def generate_c2(runs: Sequence[RunBundle], out_dir: Path, **_: Any) -> Dict[str,
          f"step {cur.get('p_regen_step', '')}" if cur.get("enabled", True) else "вимкнено"),
         ("Обладнання", str(hw)),
         (UK["seeds"], ", ".join(seeds) or UK["not_eval"]),
-        ("regen-branch", str(cfg.get("regen_branch", meta.get("regen_branch", "")))),
-        ("config hash", str(meta.get("config_hash", ""))),
+        ("Гілка регенерації", str(cfg.get("regen_branch", meta.get("regen_branch", "")))),
+        ("Хеш конфігурації", str(meta.get("config_hash", ""))),
     ]
     headers = ["Гіперпараметр", "Значення"]
     rows = [[k, v] for k, v in items]
-    artifacts = _write_table(out_dir, "c2", headers, rows, colspec="ll")
+    artifacts = _write_table(out_dir, "c2", headers, rows, colspec="ll", title="Гіперпараметри навчання")
     cap = (
         f"\\caption{{Гіперпараметри навчання (розв'язана конфігурація та \\texttt{{run\\_meta.json}}). "
         f"Набір даних: {meta.get('dataset', cfg.get('dataset', ''))}. "
@@ -1452,7 +1583,7 @@ def generate_h1(runs: Sequence[RunBundle], out_dir: Path, **_: Any) -> Dict[str,
                 col("decode_latency_ms"),
             ]
         )
-    artifacts = _write_table(out_dir, "h1", headers, rows)
+    artifacts = _write_table(out_dir, "h1", headers, rows, title="Обчислювальна вартість")
     n_seeds = len({r.seed for r in runs if r.cost})
     cap = (
         f"\\caption{{Обчислювальна вартість (з \\texttt{{cost.json}}). "
