@@ -27,24 +27,22 @@ epochs: 100
 # Keep perceptual weight low so decode loss can form a watermark channel first.
 lambda_perc: 0.05
 val_every: 5
-resume: null  # path to checkpoint
+resume: null  # path | run-dir | auto
+ckpt_every_iters: 500
+amp: false
+# Optional CosineAnnealingLR over total epochs; null = constant LR (still checkpointed).
+lr_scheduler: null  # null | cosine
 
-# --- attack sampler probabilities (baseline before curriculum) ---
-# p(dist), p(regen), p(adv); residual probability is clean (identity).
-attack_probs: [0.3, 0.3, 0.2]
-
-# --- curriculum ---
-# Warm-start: clean-only embed→decode (λ_perc≈0), then ramp attacks.
+# --- curriculum (attack branch probabilities) ---
+# p_regen(e) = min(p0 + kappa * e, p_max)
+# p_dist(e)  = 1 - p_regen(e) - p_adv
+# p_adv      = constant
+# Constraint: p_max + p_adv <= 1. Override via CLI, e.g. --curriculum-p0 0.1
 curriculum:
-  enabled: true
-  warm_start_epochs: 50
-  warm_lambda_perc: 0.0
-  p_regen_start: 0.05
-  p_regen_step: 0.008
-  p_regen_max: 0.3
-  p_dist_floor: 0.15
-  p_adv: 0.1
-  p_clean_floor: 0.25
+  p0: 0.1
+  kappa: 0.01
+  p_max: 0.5
+  p_adv: 0.2
 
 # --- DistortionBank / DiffJPEG ---
 # Set use_real_diffjpeg=true for block-DCT + STE JPEG (see src/attacks/diffjpeg_real.py).
@@ -55,6 +53,22 @@ diffjpeg:
 
 distortion:
   gaussian_std: 0.03
+  # Geometric share of distortion-branch draws (rest = jpeg/noise/downsample).
+  geometric_share: 0.5
+  padding_mode: border  # zeros | border | reflection
+  max_angle: 15.0       # degrees, sampled in [-max_angle, max_angle]
+  crop_area: [0.7, 1.0] # area fraction before resize-back
+  scale: [0.8, 1.2]     # zoom in / out
+  translate: 0.05       # max shift as fraction of side
+  # Relative weights within classical / geometric groups (renormalized).
+  weights:
+    jpeg: 1.0
+    noise: 1.0
+    downsample: 1.0
+    rotate: 1.0
+    crop: 1.0
+    rescale: 1.0
+    translate: 1.0
 
 # --- PGD adversarial attack on decoder ---
 pgd:
@@ -66,26 +80,37 @@ pgd:
 regen_branch: ddim_proxy
 
 # --- RegenerationProxy (diffusion surrogate) ---
-# Set use_placeholder=false to load real SD VAE/UNet/DDIM from sd_model_id.
-# CLIP text embeds load automatically when the real proxy is used (or when
-# use_real_text_embeds=true). image_size should be a multiple of 8 for the VAE.
+# Set use_placeholder=false to load real SD VAE/UNet/DDIM + empty-prompt embeds
+# from the same Hugging Face checkpoint (sd_model_id + sd_revision).
+# The text encoder is used once at startup then freed; embeds may be disk-cached.
+# image_size should be a multiple of 8 for the VAE.
 regen:
   use_placeholder: true
   sd_model_id: runwayml/stable-diffusion-v1-5
+  sd_revision: null  # HF revision; null → default branch
+  null_text_cache_dir: .cache/null_text_embeds
   n_steps: 4
   t_start: 0.3
   torch_dtype: null  # null → fp16 on CUDA, fp32 on CPU
   local_files_only: false
-  use_real_text_embeds: false
-  prompt: ""  # empty = unconditional null-text (DiffPure / regen style)
-  text_embed_seq_len: 77
-  text_embed_dim: 768
+  text_embed_seq_len: 77  # placeholder zeros only
+  text_embed_dim: 768     # placeholder zeros only
   guidance_scale: 2.0
+  # Guided PGD on regeneration output (second half of training).
+  # guided_start_epoch: null → epochs // 2
+  guided_start_epoch: null
+  guided_prob: 0.5
+  eps_guided: 0.02
+  beta_guided: 0.005
+  J_guided: 5
 
-# --- evaluation ---
+# --- evaluation (real transforms; never training DistortionBank approximations) ---
 eval:
-  attacks: [clean, jpeg, regen, guided_regen, unseen_blur]
-  # UNSEEN attack held out from training DistortionBank
+  attacks: [clean, jpeg, rotate, crop, noise, unseen_blur, diffpure, rinse_2, rinse_4, bmshj2018, cheng2020, adv]
+  # DiffPure / rinse use a DIFFERENT diffusion checkpoint than regen.sd_model_id.
+  diffpure_model_id: CompVis/stable-diffusion-v1-4
+  diffpure_steps: 50
+  diffpure_t_start: 0.5
   unseen_blur_kernel: 5
   unseen_blur_sigma: 1.5
 

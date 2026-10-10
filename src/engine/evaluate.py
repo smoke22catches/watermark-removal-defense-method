@@ -1,28 +1,32 @@
-"""Evaluation: attack sweep including UNSEEN attacks held out from training."""
+"""Evaluation: real-transform sweep (never uses training DistortionBank approximations)."""
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from src.attacks.registry import (
+from src.attacks.regeneration import TextConditioner, make_text_embeds
+from src.eval.metrics import perturbation_lpips, perturbation_norms
+from src.eval.registry import (
     ATTACK_REGISTRY,
     apply_spec,
     default_strength,
     get_attack,
 )
-from src.attacks.regeneration import TextConditioner, make_text_embeds
 from src.utils.metrics import (
     FIDMeter,
     LPIPSMeter,
+    NOT_EVALUATED,
     bit_accuracy_per_image,
+    compute_detection_report,
+    detection_applicable,
     long_row,
+    matched_bit_counts,
     psnr_batch,
     ssim_batch,
-    tpr_at_fpr,
 )
 
 
@@ -36,7 +40,7 @@ def apply_attack(
     config: Optional[Mapping[str, Any]] = None,
     strength: Optional[float] = None,
 ) -> torch.Tensor:
-    """Apply a named attack for evaluation (registry-backed)."""
+    """Apply a named evaluation transform (registry-backed, 8-bit quantized)."""
     config = config or {}
     alias = "unseen_blur" if name == "unseen" else name
     try:
@@ -56,7 +60,7 @@ def apply_attack(
 
 
 def _needs_grad(attack_id: str) -> bool:
-    return attack_id in ("guided_regen", "adv")
+    return attack_id in ("adv",)
 
 
 def evaluate_protocol(
@@ -77,19 +81,40 @@ def evaluate_protocol(
     compute_quality: bool = True,
     quality_only: bool = False,
 ) -> List[Dict[str, Any]]:
-    """Full evaluation protocol → long-format rows (bit-acc, TPR, PSNR/SSIM/LPIPS/FID)."""
+    """Full evaluation protocol → long-format rows (bit-acc, pert norms, LPIPS, …)."""
     config = config or {}
     regen_cfg = config.get("regen", {})
     encoder.eval()
     decoder.eval()
 
     if attacks is None:
-        attacks = [s.id for s in ATTACK_REGISTRY]
+        attacks = [s.id for s in ATTACK_REGISTRY if not s.not_evaluated]
     if quality_only:
         attacks = ["clean"]
 
     lpips_meter = LPIPSMeter().to(device) if compute_quality else None
     rows: List[Dict[str, Any]] = []
+    k = int(msg_len)
+    det_ok = detection_applicable(k)
+
+    # Clean, never-watermarked detection statistics (shared across attacks).
+    clean_stats: List[float] = []
+    if compute_detection and det_ok:
+        with torch.no_grad():
+            for batch in val_loader:
+                x = batch[0].to(device)
+                m_ref = torch.randint(0, 2, (x.size(0), k), device=device).float()
+                logits_clean = decoder(x)
+                clean_stats.extend(matched_bit_counts(logits_clean, m_ref).cpu().tolist())
+        if len(clean_stats) < 5000:
+            print(
+                f"[WARNING] clean detection set has {len(clean_stats)} < 5000 images; "
+                "0.1% FPR cannot be estimated reliably"
+            )
+    elif compute_detection and not det_ok:
+        print(
+            f"[eval] detection metrics not applicable for msg_len={k} (zero-bit scheme)"
+        )
 
     for attack_id in attacks:
         try:
@@ -97,6 +122,10 @@ def evaluate_protocol(
         except KeyError:
             print(f"[eval] skipping unknown attack '{attack_id}'")
             continue
+        if spec.not_evaluated:
+            print(f"[eval] skipping not_evaluated '{spec.id}': {spec.not_evaluated_reason}")
+            continue
+
         strengths: Sequence[float]
         if sweep_strengths:
             strengths = spec.strengths
@@ -106,15 +135,17 @@ def evaluate_protocol(
         for strength in strengths:
             fid = FIDMeter(device=device) if compute_fid and compute_quality else None
             bit_accs: List[float] = []
-            scores_pos: List[float] = []
-            scores_neg: List[float] = []
+            pos_stats: List[float] = []
             psnrs: List[float] = []
             ssims: List[float] = []
             lpips_vals: List[float] = []
+            pert_l2: List[float] = []
+            pert_linf: List[float] = []
+            pert_lpips: List[float] = []
 
             for batch in val_loader:
                 x = batch[0].to(device)
-                m = torch.randint(0, 2, (x.size(0), msg_len), device=device).float()
+                m = torch.randint(0, 2, (x.size(0), k), device=device).float()
                 with torch.no_grad():
                     x_w = encoder(x, m)
                 text_embeds = make_text_embeds(
@@ -123,6 +154,7 @@ def evaluate_protocol(
                     seq_len=int(regen_cfg.get("text_embed_seq_len", 77)),
                     dim=int(regen_cfg.get("text_embed_dim", 768)),
                     conditioner=text_conditioner,
+                    regen_proxy=regen_proxy,
                 )
 
                 def _run_attack() -> torch.Tensor:
@@ -148,14 +180,15 @@ def evaluate_protocol(
                     logits = decoder(x_test)
                     acc = bit_accuracy_per_image(logits, m)
                     bit_accs.extend(acc.detach().cpu().tolist())
-                    scores_pos.extend(acc.detach().cpu().tolist())
-                    if compute_detection:
-                        logits_neg = decoder(x)
-                        scores_neg.extend(
-                            bit_accuracy_per_image(logits_neg, m).detach().cpu().tolist()
-                        )
+                    if compute_detection and det_ok:
+                        pos_stats.extend(matched_bit_counts(logits, m).cpu().tolist())
+                    # Perturbation vs watermarked image (required by protocol).
+                    norms = perturbation_norms(x_w, x_test)
+                    pert_l2.extend(norms["pert_l2"])
+                    pert_linf.extend(norms["pert_linf"])
+                    if lpips_meter is not None:
+                        pert_lpips.extend(perturbation_lpips(x_w, x_test, lpips_meter))
                     if compute_quality:
-                        # Attacked image vs original cover (paired quality).
                         psnrs.extend(psnr_batch(x, x_test))
                         ssims.extend(ssim_batch(x, x_test))
                         if lpips_meter is not None:
@@ -176,15 +209,38 @@ def evaluate_protocol(
                 delta=spec.delta,
                 knowledge_level=spec.knowledge_level,
                 seen_flag=seen,
+                source=spec.source,
             )
 
             def _emit(name: str, value: Any) -> None:
                 rows.append(long_row(metric_name=name, metric_value=value, **common))
 
             _emit("bit_accuracy", _mean(bit_accs))
+            _emit("pert_l2", _mean(pert_l2))
+            _emit("pert_linf", _mean(pert_linf))
+            _emit("pert_lpips", _mean(pert_lpips))
             if compute_detection:
-                _emit("tpr_at_0.1pct_fpr", tpr_at_fpr(scores_pos, scores_neg, 0.001))
-                _emit("tpr_at_1pct_fpr", tpr_at_fpr(scores_pos, scores_neg, 0.01))
+                for target, tag in ((1e-3, "0.1pct"), (1e-2, "1pct")):
+                    if not det_ok:
+                        _emit(f"tpr_at_{tag}_fpr", NOT_EVALUATED)
+                        _emit(f"empirical_fpr_at_{tag}", NOT_EVALUATED)
+                        _emit(f"tpr_at_empirical_{tag}_fpr", NOT_EVALUATED)
+                        _emit(f"analytic_threshold_{tag}", NOT_EVALUATED)
+                        _emit(f"empirical_threshold_{tag}", NOT_EVALUATED)
+                        continue
+                    report = compute_detection_report(
+                        pos_stats, clean_stats, msg_len=k, target_fpr=target
+                    )
+                    _emit(f"tpr_at_{tag}_fpr", report.tpr_analytic)
+                    _emit(f"empirical_fpr_at_{tag}", report.empirical_fpr)
+                    _emit(f"tpr_at_empirical_{tag}_fpr", report.tpr_empirical)
+                    _emit(f"analytic_threshold_{tag}", report.analytic_threshold)
+                    _emit(f"empirical_threshold_{tag}", report.empirical_threshold)
+                    if report.warning:
+                        print(
+                            f"[WARNING] {spec.id} strength={strength} FPR={target:g}: "
+                            f"{report.warning}"
+                        )
             if compute_quality:
                 _emit("psnr", _mean(psnrs))
                 _emit("ssim", _mean(ssims))
@@ -195,7 +251,18 @@ def evaluate_protocol(
 
             mean_acc = _mean(bit_accs)
             if bit_accs:
-                print(f"{spec.id} strength={strength}: bit-accuracy = {mean_acc:.4f}")
+                extra = ""
+                if compute_detection and det_ok and pos_stats:
+                    r01 = compute_detection_report(pos_stats, clean_stats, k, 1e-3)
+                    r1 = compute_detection_report(pos_stats, clean_stats, k, 1e-2)
+                    extra = (
+                        f" TPR@0.1%FPR={r01.tpr_analytic:.4f} "
+                        f"TPR@1%FPR={r1.tpr_analytic:.4f}"
+                    )
+                print(
+                    f"{spec.id} strength={strength}: bit-accuracy = {mean_acc:.4f} "
+                    f"pert_l2={_mean(pert_l2):.4f} pert_linf={_mean(pert_linf):.4f}{extra}"
+                )
             else:
                 print(f"{spec.id} strength={strength}: bit-accuracy = n/a")
 
@@ -208,16 +275,13 @@ def evaluate(
     decoder: nn.Module,
     val_loader: DataLoader,
     device: str = "cuda",
-    attacks: Sequence[str] = ("clean", "jpeg", "regen", "guided_regen", "unseen_blur"),
+    attacks: Sequence[str] = ("clean", "jpeg", "diffpure", "rinse_2", "unseen_blur"),
     msg_len: int = 64,
     regen_proxy: Optional[nn.Module] = None,
     config: Optional[Mapping[str, Any]] = None,
     text_conditioner: Optional[TextConditioner] = None,
 ) -> Dict[str, List[float]]:
-    """Attack sweep over the validation loader; returns per-attack bit-accuracy lists.
-
-    Backward-compatible wrapper around :func:`evaluate_protocol`.
-    """
+    """Attack sweep over the validation loader; returns per-attack bit-accuracy lists."""
     rows = evaluate_protocol(
         encoder,
         decoder,
@@ -233,36 +297,29 @@ def evaluate(
         compute_fid=False,
         compute_quality=False,
     )
-    results: Dict[str, List[float]] = {a: [] for a in attacks}
+    out: Dict[str, List[float]] = {}
     for row in rows:
         if row.get("metric_name") == "bit_accuracy":
-            try:
-                results[str(row["attack"])].append(float(row["metric_value"]))
-            except (TypeError, ValueError, KeyError):
-                pass
-    for a in attacks:
-        if results[a]:
-            mean_acc = sum(results[a]) / len(results[a])
-            print(f"{a}: bit-accuracy = {mean_acc:.4f}")
-        else:
-            print(f"{a}: bit-accuracy = n/a")
-    return results
+            out.setdefault(str(row["attack"]), []).append(float(row["metric_value"]))
+    return out
 
 
+@torch.no_grad()
 def evaluate_single_image(
     encoder: nn.Module,
     decoder: nn.Module,
     image: torch.Tensor,
     device: str = "cuda",
-    msg: Optional[torch.Tensor] = None,
+    attack: str = "clean",
     msg_len: int = 64,
-    attack: Optional[str] = None,
+    msg: Optional[torch.Tensor] = None,
     regen_proxy: Optional[nn.Module] = None,
     config: Optional[Mapping[str, Any]] = None,
     text_conditioner: Optional[TextConditioner] = None,
 ) -> Dict[str, Any]:
-    """Embed / optionally attack / decode a single image; report bits + PSNR/SSIM."""
-    from skimage.metrics import peak_signal_noise_ratio, structural_similarity
+    """Embed + optional attack + decode for a single image tensor in [-1, 1]."""
+    from src.eval.registry import apply_spec as _apply
+    from src.eval.registry import get_attack as _get
 
     config = config or {}
     regen_cfg = config.get("regen", {})
@@ -279,50 +336,54 @@ def evaluate_single_image(
         if m.ndim == 1:
             m = m.unsqueeze(0)
 
-    with torch.no_grad():
-        x_w = encoder(x, m)
-
+    x_w = encoder(x, m)
     text_embeds = make_text_embeds(
         x.size(0),
         device,
         seq_len=int(regen_cfg.get("text_embed_seq_len", 77)),
         dim=int(regen_cfg.get("text_embed_dim", 768)),
         conditioner=text_conditioner,
+        regen_proxy=regen_proxy,
     )
 
     x_test = x_w
     if attack and attack != "clean":
+        spec = _get(attack)
         if _needs_grad(attack):
             with torch.enable_grad():
-                x_test = apply_attack(
-                    attack, x_w, m, decoder, regen_proxy, text_embeds, config
+                x_test = _apply(
+                    spec, x_w, message=m, decoder=decoder,
+                    regen_proxy=regen_proxy, text_embeds=text_embeds, config=config,
                 )
         else:
-            with torch.no_grad():
-                x_test = apply_attack(
-                    attack, x_w, m, decoder, regen_proxy, text_embeds, config
-                )
+            x_test = _apply(
+                spec, x_w, message=m, decoder=decoder,
+                regen_proxy=regen_proxy, text_embeds=text_embeds, config=config,
+            )
 
-    with torch.no_grad():
-        logits = decoder(x_test)
-        bits = (torch.sigmoid(logits) > 0.5).float()
-        bit_acc = (bits == m).float().mean().item()
+    logits = decoder(x_test)
+    bits = (torch.sigmoid(logits) > 0.5).float()
+    bit_acc = (bits == m).float().mean().item()
 
     def _to01(t: torch.Tensor) -> torch.Tensor:
         return ((t.detach().cpu().clamp(-1, 1) + 1) / 2).squeeze(0)
+
+    from skimage.metrics import peak_signal_noise_ratio, structural_similarity
 
     x01 = _to01(x).permute(1, 2, 0).numpy()
     xw01 = _to01(x_w).permute(1, 2, 0).numpy()
     psnr = float(peak_signal_noise_ratio(x01, xw01, data_range=1.0))
     ssim = float(structural_similarity(x01, xw01, channel_axis=2, data_range=1.0))
+    norms = perturbation_norms(x_w, x_test)
 
     return {
-        "message": m.detach().cpu(),
-        "recovered": bits.detach().cpu(),
         "bit_accuracy": bit_acc,
-        "psnr": psnr,
-        "ssim": ssim,
-        "x": x.detach().cpu(),
+        "bits": bits.detach().cpu(),
+        "message": m.detach().cpu(),
+        "psnr_cover_wm": psnr,
+        "ssim_cover_wm": ssim,
+        "pert_l2": float(sum(norms["pert_l2"]) / max(len(norms["pert_l2"]), 1)),
+        "pert_linf": float(sum(norms["pert_linf"]) / max(len(norms["pert_linf"]), 1)),
         "x_w": x_w.detach().cpu(),
         "x_test": x_test.detach().cpu(),
     }

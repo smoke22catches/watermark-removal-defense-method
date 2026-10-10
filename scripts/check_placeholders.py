@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Smoke checks for DiffJPEG STE path and optional real SD / CLIP loading."""
+"""Smoke checks for DiffJPEG STE path and optional real SD / null-text loading."""
 
 from __future__ import annotations
 
@@ -33,50 +33,42 @@ def check_placeholder_regen() -> None:
 
     proxy = build_regen_proxy(use_placeholder=True)
     x = torch.randn(1, 3, 64, 64)
-    te = make_text_embeds(1, "cpu")
+    te = make_text_embeds(1, "cpu", regen_proxy=proxy)
     y = proxy(x, te)
     assert y.shape == x.shape
+    assert te.shape[-1] == 768
     print("[ok] Placeholder RegenerationProxy forward")
 
 
-def check_real_sd(device: str, model_id: str, local_files_only: bool) -> None:
-    from src.attacks.regeneration import (
-        build_regen_proxy,
-        build_text_conditioner,
-        make_text_embeds,
-    )
+def check_real_sd(device: str, model_id: str, revision: str | None, local_files_only: bool) -> None:
+    from src.attacks.regeneration import build_regen_proxy, make_text_embeds
 
-    print(f"[..] loading real regen + CLIP on {device} ({model_id}) …")
+    print(f"[..] loading real regen + null-text on {device} ({model_id}, rev={revision}) …")
     proxy = build_regen_proxy(
         use_placeholder=False,
         sd_model_id=model_id,
+        sd_revision=revision,
         n_steps=2,
         t_start=0.3,
         device=device,
         local_files_only=local_files_only,
     )
-    conditioner = build_text_conditioner(
-        use_real_text_embeds=True,
-        use_placeholder_regen=False,
-        sd_model_id=model_id,
-        prompt="",
-        device=device,
-        local_files_only=local_files_only,
-    )
     x = torch.randn(1, 3, 128, 128, device=device)
-    te = make_text_embeds(1, device, conditioner=conditioner)
+    te = make_text_embeds(1, device, regen_proxy=proxy)
+    assert te.shape[-1] == int(proxy.unet.config.cross_attention_dim)
     with torch.no_grad():
-        y = proxy(x, te)
+        y = proxy(x)  # expands cached empty-prompt embeds internally
     assert y.shape == x.shape
     assert y.min() >= -1.0 - 1e-3 and y.max() <= 1.0 + 1e-3
-    print("[ok] Real RegenerationProxy + CLIP text embeds forward")
+    print("[ok] Real RegenerationProxy + unconditional null-text forward")
 
 
 def main() -> int:
     p = argparse.ArgumentParser(description="Validate placeholder implementations")
-    p.add_argument("--skip-sd", action="store_true", help="Skip real SD/CLIP load test")
+    p.add_argument("--skip-sd", action="store_true", help="Skip real SD/null-text load test")
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--sd-model-id", type=str, default="runwayml/stable-diffusion-v1-5")
+    p.add_argument("--sd-revision", type=str, default=None)
     p.add_argument("--local-files-only", action="store_true")
     args = p.parse_args()
 
@@ -84,18 +76,18 @@ def main() -> int:
     check_placeholder_regen()
 
     if args.skip_sd:
-        print("[skip] real SD/CLIP (--skip-sd)")
+        print("[skip] real SD/null-text (--skip-sd)")
         return 0
 
     device = args.device
     if device.startswith("cuda") and not torch.cuda.is_available():
-        print("[skip] real SD/CLIP (CUDA unavailable)")
+        print("[skip] real SD/null-text (CUDA unavailable)")
         return 0
 
     try:
-        check_real_sd(device, args.sd_model_id, args.local_files_only)
+        check_real_sd(device, args.sd_model_id, args.sd_revision, args.local_files_only)
     except Exception as e:
-        print(f"[skip] real SD/CLIP unavailable: {e}")
+        print(f"[skip] real SD/null-text unavailable: {e}")
         return 0
 
     print("=== all placeholder checks passed ===")

@@ -17,7 +17,8 @@ if str(ROOT) not in sys.path:
 from src.data.datasets import build_dataloaders
 from src.engine.train import export_algorithm_tex, train
 from src.models import Decoder, Encoder
-from src.utils.config import add_common_train_args, config_from_args
+from src.utils.checkpoint import COMPLETED_MARKER
+from src.utils.config import add_common_train_args, config_from_args, load_yaml
 from src.utils.logging import RunLogger, create_run_dir
 from src.utils.metrics import PROTOCOL_VERSION, config_hash, dump_json, git_commit_hash, utc_now_iso
 from src.utils.seed import set_seed
@@ -30,18 +31,67 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _resolve_run_dir(args: argparse.Namespace, cfg: dict) -> Path:
+    """Pick an existing run dir for resume, or create a new one."""
+    resume = cfg.get("resume")
+    run_dir_cfg = cfg.get("run_dir") or getattr(args, "run_dir", None)
+    if run_dir_cfg:
+        path = Path(run_dir_cfg)
+        path.mkdir(parents=True, exist_ok=True)
+        (path / "checkpoints").mkdir(parents=True, exist_ok=True)
+        (path / "plots").mkdir(parents=True, exist_ok=True)
+        return path
+    if resume not in (None, "", False):
+        resume_s = str(resume)
+        if resume_s.lower() != "auto":
+            p = Path(resume_s)
+            if p.is_dir():
+                return p
+            if p.is_file():
+                # checkpoints/iter_x.pt → run dir
+                parent = p.parent
+                return parent.parent if parent.name == "checkpoints" else parent
+        raise SystemExit(
+            "--resume auto (or a bare checkpoint path without --run-dir) requires "
+            "--run-dir pointing at the existing run directory."
+        )
+    return create_run_dir(
+        args.runs_root, str(cfg.get("run_name", "default")), seed=int(cfg.get("seed", 42))
+    )
+
+
 def main() -> None:
     args = parse_args()
     cfg = config_from_args(args)
     seed = int(cfg.get("seed", 42))
     cfg["seed"] = seed
     cfg.setdefault("regen_branch", "ddim_proxy")
+
+    run_dir = _resolve_run_dir(args, cfg)
+    cfg["run_dir"] = str(run_dir)
+
+    # On resume, prefer the snapshot saved with the run so config hashes match.
+    resume = cfg.get("resume")
+    saved_cfg_path = run_dir / "config.yaml"
+    if resume not in (None, "", False) and saved_cfg_path.is_file():
+        saved = load_yaml(saved_cfg_path)
+        keep_resume = cfg.get("resume")
+        keep_device = cfg.get("device")
+        saved["resume"] = keep_resume
+        if keep_device is not None:
+            saved["device"] = keep_device
+        saved["run_dir"] = str(run_dir)
+        saved["seed"] = seed
+        cfg = saved
+
+    if (run_dir / COMPLETED_MARKER).exists() and resume not in (None, "", False):
+        print(f"Run already completed: {run_dir / COMPLETED_MARKER}")
+        print("Skipping training.")
+        return
+
     set_seed(seed)
 
-    run_dir = create_run_dir(
-        args.runs_root, str(cfg.get("run_name", "default")), seed=seed
-    )
-    logger = RunLogger(run_dir, cfg)
+    logger = RunLogger(run_dir, cfg, append_metrics=True)
     logger.log(f"Run directory: {run_dir}")
     logger.log(f"seed={seed} regen_branch={cfg.get('regen_branch')} config_hash={config_hash(cfg)}")
 
@@ -49,7 +99,6 @@ def main() -> None:
     if export_path:
         out = export_algorithm_tex(cfg, export_path)
         logger.log(f"Wrote Algorithm 1 to {out}")
-    # Always snapshot the algorithm next to the run as well.
     export_algorithm_tex(cfg, run_dir / "algorithm1.tex")
 
     meta = {
@@ -91,7 +140,7 @@ def main() -> None:
     decoder = Decoder(msg_len=msg_len, ch=int(cfg.get("decoder_ch", 64)))
 
     try:
-        train(
+        result = train(
             encoder,
             decoder,
             train_loader,
@@ -100,7 +149,10 @@ def main() -> None:
             run_dir=run_dir,
             logger=logger,
         )
-        meta["status"] = "done"
+        if result.get("interrupted"):
+            meta["status"] = "interrupted"
+        else:
+            meta["status"] = "done"
     except Exception:
         meta["status"] = "failed"
         meta["end_ts"] = utc_now_iso()

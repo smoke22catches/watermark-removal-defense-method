@@ -858,49 +858,57 @@ def generate_c3(runs: Sequence[RunBundle], out_dir: Path, **_: Any) -> Dict[str,
     headers = [
         UK["attack"],
         UK["attack_class"],
+        "Джерело",
         "Імплементація",
         UK["attack_strength"],
         r"$\varepsilon$",
         r"$\delta$",
         UK["knowledge"],
         "Вид",
+        "Статус",
     ]
     rows = []
     csv_headers = [
-        "attack", "class", "implementation", "strengths", "epsilon", "delta",
-        "knowledge_level", "seen_in_training",
+        "attack", "class", "source", "implementation", "strengths", "epsilon", "delta",
+        "knowledge_level", "seen_in_training", "not_evaluated",
     ]
     csv_rows = []
     for spec in ATTACK_REGISTRY:
         seen = UK["seen"] if spec.seen_in_training else UK["unseen"]
         k = {"black": "чорний", "grey": "сірий", "white": "білий"}[spec.knowledge_level]
         strengths = ", ".join(str(s) for s in spec.strengths)
+        status = "not_evaluated" if getattr(spec, "not_evaluated", False) else "active"
+        source = getattr(spec, "source", "own")
         rows.append(
             [
                 spec.label_uk,
                 CLASS_LABEL_UK.get(spec.cls, spec.cls),
+                source.replace("_", r"\_"),
                 spec.implementation.replace("_", r"\_"),
                 strengths,
                 f"{spec.epsilon:g}",
                 f"{spec.delta:g}",
                 k,
                 seen,
+                status.replace("_", r"\_"),
             ]
         )
         csv_rows.append(
             [
                 spec.id,
                 spec.cls,
+                source,
                 spec.implementation,
                 strengths,
                 spec.epsilon,
                 spec.delta,
                 spec.knowledge_level,
                 spec.seen_in_training,
+                getattr(spec, "not_evaluated", False),
             ]
         )
     artifacts = _write_table(
-        out_dir, "c3", headers, rows, colspec="lllp{3.2cm}cccc",
+        out_dir, "c3", headers, rows, colspec="lll p{2.8cm}p{2.4cm}ccccc",
         title="Єдиний протокол оцінювання",
     )
     # overwrite csv with machine-readable ids
@@ -1513,8 +1521,8 @@ def generate_c2(runs: Sequence[RunBundle], out_dir: Path, **_: Any) -> Dict[str,
         (r"PGD $(\varepsilon, \alpha, T)$",
          f"({pgd.get('eps', '')}, {pgd.get('alpha', '')}, {pgd.get('steps', '')})"),
         ("Навчальний план",
-         f"p_regen {cur.get('p_regen_start', '')}→{cur.get('p_regen_max', '')} "
-         f"step {cur.get('p_regen_step', '')}" if cur.get("enabled", True) else "вимкнено"),
+         f"p0={cur.get('p0', 0.1)}, kappa={cur.get('kappa', 0.01)}, "
+         f"p_max={cur.get('p_max', 0.5)}, p_adv={cur.get('p_adv', 0.2)}"),
         ("Обладнання", str(hw)),
         (UK["seeds"], ", ".join(seeds) or UK["not_eval"]),
         ("Гілка регенерації", str(cfg.get("regen_branch", meta.get("regen_branch", "")))),

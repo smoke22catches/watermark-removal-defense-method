@@ -90,7 +90,25 @@ def add_common_train_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--lambda-perc", type=float, default=None)
     parser.add_argument("--regen-steps", type=int, default=None, dest="regen_steps")
-    parser.add_argument("--resume", type=str, default=None)
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        help="Checkpoint path, run directory, or 'auto' (latest valid in --run-dir)",
+    )
+    parser.add_argument(
+        "--run-dir",
+        type=str,
+        default=None,
+        help="Existing run directory (required for --resume auto; skips create_run_dir)",
+    )
+    parser.add_argument(
+        "--ckpt-every-iters",
+        type=int,
+        default=None,
+        dest="ckpt_every_iters",
+        help="Save a checkpoint every N iterations (default from config: 500)",
+    )
     parser.add_argument(
         "--regen-branch",
         type=str,
@@ -106,6 +124,34 @@ def add_common_train_args(parser: argparse.ArgumentParser) -> None:
         help="Write a LaTeX algorithm/algorithmic block reflecting the actual training loop",
     )
     parser.add_argument(
+        "--curriculum-p0",
+        type=float,
+        default=None,
+        dest="curriculum_p0",
+        help="Curriculum p0 (initial p_regen); default 0.1",
+    )
+    parser.add_argument(
+        "--curriculum-kappa",
+        type=float,
+        default=None,
+        dest="curriculum_kappa",
+        help="Curriculum kappa (p_regen step per epoch); default 0.01",
+    )
+    parser.add_argument(
+        "--curriculum-p-max",
+        type=float,
+        default=None,
+        dest="curriculum_p_max",
+        help="Curriculum p_max (cap on p_regen); default 0.5",
+    )
+    parser.add_argument(
+        "--curriculum-p-adv",
+        type=float,
+        default=None,
+        dest="curriculum_p_adv",
+        help="Curriculum p_adv (constant); default 0.2",
+    )
+    parser.add_argument(
         "--set",
         dest="set_overrides",
         action="append",
@@ -116,6 +162,8 @@ def add_common_train_args(parser: argparse.ArgumentParser) -> None:
 
 def config_from_args(args: argparse.Namespace) -> Dict[str, Any]:
     """Load default YAML and apply known CLI flags + --set overrides."""
+    from src.attacks.sampler import validate_curriculum_config
+
     cfg = load_yaml(args.config)
     mapping = {
         "seed": "seed",
@@ -135,6 +183,8 @@ def config_from_args(args: argparse.Namespace) -> Dict[str, Any]:
         "resume": "resume",
         "regen_branch": "regen_branch",
         "export_algorithm": "export_algorithm",
+        "run_dir": "run_dir",
+        "ckpt_every_iters": "ckpt_every_iters",
     }
     for attr, key in mapping.items():
         val = getattr(args, attr, None)
@@ -143,6 +193,16 @@ def config_from_args(args: argparse.Namespace) -> Dict[str, Any]:
     if getattr(args, "regen_steps", None) is not None:
         cfg.setdefault("regen", {})
         cfg["regen"]["n_steps"] = args.regen_steps
+    cur = cfg.setdefault("curriculum", {})
+    if getattr(args, "curriculum_p0", None) is not None:
+        cur["p0"] = float(args.curriculum_p0)
+    if getattr(args, "curriculum_kappa", None) is not None:
+        cur["kappa"] = float(args.curriculum_kappa)
+    if getattr(args, "curriculum_p_max", None) is not None:
+        cur["p_max"] = float(args.curriculum_p_max)
+    if getattr(args, "curriculum_p_adv", None) is not None:
+        cur["p_adv"] = float(args.curriculum_p_adv)
     apply_set_overrides(cfg, getattr(args, "set_overrides", None))
     cfg.setdefault("regen_branch", "ddim_proxy")
+    validate_curriculum_config(cfg)
     return cfg

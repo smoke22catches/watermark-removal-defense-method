@@ -22,6 +22,7 @@ import yaml
 # Canonical long-format schema used by metrics.csv and results.csv.
 LONG_FIELDS: List[str] = [
     "epoch",
+    "global_step",
     "seed",
     "attack",
     "strength",
@@ -316,8 +317,156 @@ def bit_accuracy_per_image(logits: torch.Tensor, message: torch.Tensor) -> torch
     return (bits == message).float().mean(dim=1)
 
 
+def matched_bit_counts(logits: torch.Tensor, message: torch.Tensor) -> torch.Tensor:
+    """Detection statistic: number of decoded bits matching the reference message."""
+    bits = (torch.sigmoid(logits) > 0.5).float()
+    return (bits == message).float().sum(dim=1)
+
+
+def detection_applicable(msg_len: int) -> bool:
+    """False for zero-bit / message-less schemes (metric is not applicable)."""
+    return int(msg_len) > 0
+
+
+def analytic_binom_threshold(msg_len: int, fpr: float) -> int:
+    """Smallest integer ``t`` s.t. ``P(Binomial(k, 0.5) >= t) <= fpr``.
+
+    Uses ``scipy.stats.binom.sf``. Returns ``k + 1`` if no such ``t`` exists in
+    ``{0, …, k}`` (never declare detection).
+    """
+    from scipy.stats import binom
+
+    k = int(msg_len)
+    target = float(fpr)
+    if k <= 0:
+        raise ValueError(f"msg_len must be positive, got {msg_len}")
+    if not (0.0 < target <= 1.0):
+        raise ValueError(f"fpr must be in (0, 1], got {fpr}")
+    for t in range(0, k + 1):
+        # P(X >= t) = 1 if t == 0 else sf(t - 1, k, 0.5)
+        p_ge = 1.0 if t == 0 else float(binom.sf(t - 1, k, 0.5))
+        if p_ge <= target:
+            return int(t)
+    return k + 1
+
+
+def binom_tail_prob(msg_len: int, threshold: int) -> float:
+    """``P(Binomial(k, 0.5) >= threshold)``."""
+    from scipy.stats import binom
+
+    k = int(msg_len)
+    t = int(threshold)
+    if t <= 0:
+        return 1.0
+    if t > k:
+        return 0.0
+    return float(binom.sf(t - 1, k, 0.5))
+
+
+def rate_at_or_above(stats: Sequence[float], threshold: float) -> float:
+    """Fraction of statistics ``>= threshold`` (TPR or empirical FPR)."""
+    arr = np.asarray(list(stats), dtype=np.float64)
+    if arr.size == 0:
+        return float("nan")
+    return float((arr >= float(threshold)).mean())
+
+
+def empirical_threshold(clean_stats: Sequence[float], fpr: float, msg_len: int) -> int:
+    """Smallest integer ``t`` with empirical FPR ``P(clean >= t) <= fpr``."""
+    k = int(msg_len)
+    target = float(fpr)
+    arr = np.asarray(list(clean_stats), dtype=np.float64)
+    if arr.size == 0:
+        return analytic_binom_threshold(k, target)
+    for t in range(0, k + 2):
+        if float((arr >= t).mean()) <= target:
+            return int(t)
+    return k + 1
+
+
+@dataclass
+class DetectionReport:
+    """Per-attack detection metrics at a target FPR."""
+
+    target_fpr: float
+    msg_len: int
+    analytic_threshold: int
+    tpr_analytic: float
+    empirical_fpr: float
+    empirical_threshold: int
+    tpr_empirical: float
+    n_clean: int
+    n_positive: int
+    applicable: bool = True
+    warning: str = ""
+
+
+def compute_detection_report(
+    pos_stats: Sequence[float],
+    clean_stats: Sequence[float],
+    msg_len: int,
+    target_fpr: float,
+    min_clean_for_low_fpr: int = 5000,
+) -> DetectionReport:
+    """TPR at analytic + empirical thresholds; warn on FPR mismatch / small clean set."""
+    pos = list(pos_stats)
+    clean = list(clean_stats)
+    if not detection_applicable(msg_len):
+        return DetectionReport(
+            target_fpr=float(target_fpr),
+            msg_len=int(msg_len),
+            analytic_threshold=-1,
+            tpr_analytic=float("nan"),
+            empirical_fpr=float("nan"),
+            empirical_threshold=-1,
+            tpr_empirical=float("nan"),
+            n_clean=len(clean),
+            n_positive=len(pos),
+            applicable=False,
+            warning="not_applicable: zero-bit / no message length",
+        )
+
+    k = int(msg_len)
+    t_an = analytic_binom_threshold(k, target_fpr)
+    t_emp = empirical_threshold(clean, target_fpr, k)
+    emp_fpr = rate_at_or_above(clean, t_an)
+    tpr_an = rate_at_or_above(pos, t_an)
+    tpr_emp = rate_at_or_above(pos, t_emp)
+    n_clean = len(clean)
+
+    warnings: List[str] = []
+    if target_fpr <= 0.001 and n_clean < min_clean_for_low_fpr:
+        warnings.append(
+            f"clean set has {n_clean} < {min_clean_for_low_fpr} images; "
+            f"{target_fpr:.1%} FPR cannot be estimated reliably"
+        )
+    if np.isfinite(emp_fpr) and emp_fpr > 2.0 * float(target_fpr) + 1e-15:
+        warnings.append(
+            f"empirical FPR {emp_fpr:.4g} exceeds 2x target {target_fpr:.4g} "
+            f"at analytic threshold t={t_an} (decoder may be biased on clean images)"
+        )
+
+    return DetectionReport(
+        target_fpr=float(target_fpr),
+        msg_len=k,
+        analytic_threshold=t_an,
+        tpr_analytic=tpr_an,
+        empirical_fpr=emp_fpr,
+        empirical_threshold=t_emp,
+        tpr_empirical=tpr_emp,
+        n_clean=n_clean,
+        n_positive=len(pos),
+        applicable=True,
+        warning="; ".join(warnings),
+    )
+
+
 def tpr_at_fpr(scores_pos: Sequence[float], scores_neg: Sequence[float], fpr: float) -> float:
-    """TPR at a target FPR using higher-is-more-watermarked scores."""
+    """Backward-compatible wrapper: empirical quantile threshold on clean scores.
+
+    Prefer :func:`compute_detection_report` (analytic Binomial threshold) for
+    published TPR@FPR numbers.
+    """
     pos = np.asarray(list(scores_pos), dtype=np.float64)
     neg = np.asarray(list(scores_neg), dtype=np.float64)
     if pos.size == 0 or neg.size == 0:
@@ -353,8 +502,10 @@ def canonical_config(cfg: Mapping[str, Any], ignore: Optional[Iterable[str]] = N
             "resume",
             "device",
             "runs_root",
+            "run_dir",
             "export_algorithm",
             "num_workers",
+            "interrupt_after_step",  # test-only early-stop hook
         )
     )
 
@@ -430,6 +581,7 @@ def load_yaml_file(path: Path | str) -> Dict[str, Any]:
 def long_row(
     *,
     epoch: Any = "",
+    global_step: Any = "",
     seed: Any = "",
     attack: str = "",
     strength: Any = "",
@@ -437,11 +589,13 @@ def long_row(
     delta: Any = "",
     knowledge_level: str = "",
     seen_flag: Any = "",
+    source: Any = "",
     metric_name: str,
     metric_value: Any,
 ) -> Dict[str, Any]:
     return {
         "epoch": epoch,
+        "global_step": global_step,
         "seed": seed,
         "attack": attack,
         "strength": strength,
@@ -449,6 +603,7 @@ def long_row(
         "delta": delta,
         "knowledge_level": knowledge_level,
         "seen_flag": seen_flag,
+        "source": source,
         "metric_name": metric_name,
         "metric_value": metric_value,
     }

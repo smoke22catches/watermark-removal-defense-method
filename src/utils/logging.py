@@ -6,7 +6,7 @@ import csv
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, TextIO
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, TextIO, Tuple
 
 import yaml
 
@@ -58,6 +58,16 @@ class _Tee:
             s.flush()
 
 
+def _row_key(row: Mapping[str, Any]) -> Tuple[str, str, str, str]:
+    """Dedup key: (global_step, metric_name, attack, epoch)."""
+    return (
+        str(row.get("global_step", "")),
+        str(row.get("metric_name", "")),
+        str(row.get("attack", "")),
+        str(row.get("epoch", "")),
+    )
+
+
 class RunLogger:
     """Per-run logger: config snapshot, long-format CSV metrics, tee'd console log."""
 
@@ -67,17 +77,34 @@ class RunLogger:
         config: Optional[Mapping[str, Any]] = None,
         metrics_filename: str = "metrics.csv",
         long_format: bool = True,
+        append_metrics: bool = True,
     ) -> None:
         self.run_dir = Path(run_dir)
         self.metrics_path = self.run_dir / metrics_filename
         self.log_path = self.run_dir / "log.txt"
         self.long_format = long_format
         self._fieldnames: Optional[List[str]] = list(LONG_FIELDS) if long_format else None
+        self._seen_keys: set = set()
+        if append_metrics and self.metrics_path.exists():
+            self._load_existing_keys()
         self._log_file = open(self.log_path, "a", encoding="utf-8")
         self._stdout = sys.stdout
         sys.stdout = _Tee(self._stdout, self._log_file)  # type: ignore[assignment]
-        if config is not None:
+        if config is not None and not (self.run_dir / "config.yaml").exists():
             save_config(config, self.run_dir / "config.yaml")
+        elif config is not None and not append_metrics:
+            save_config(config, self.run_dir / "config.yaml")
+
+    def _load_existing_keys(self) -> None:
+        try:
+            with open(self.metrics_path, "r", newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                if reader.fieldnames:
+                    self._fieldnames = list(reader.fieldnames)
+                for row in reader:
+                    self._seen_keys.add(_row_key(row))
+        except OSError:
+            pass
 
     def log(self, message: str) -> None:
         print(message)
@@ -94,10 +121,20 @@ class RunLogger:
     def log_metric_rows(self, rows: Sequence[Mapping[str, Any]]) -> None:
         if not rows:
             return
+        new_rows: List[Mapping[str, Any]] = []
+        for row in rows:
+            key = _row_key(row)
+            # Dedup when global_step is present; always allow blank-step rows once keyed.
+            if key in self._seen_keys and str(row.get("global_step", "")) != "":
+                continue
+            self._seen_keys.add(key)
+            new_rows.append(row)
+        if not new_rows:
+            return
         write_header = not self.metrics_path.exists()
         if self._fieldnames is None:
-            self._fieldnames = list(rows[0].keys())
-        for row in rows:
+            self._fieldnames = list(new_rows[0].keys())
+        for row in new_rows:
             for k in row:
                 if k not in self._fieldnames:
                     self._fieldnames.append(k)
@@ -105,7 +142,7 @@ class RunLogger:
             writer = csv.DictWriter(f, fieldnames=self._fieldnames, extrasaction="ignore")
             if write_header:
                 writer.writeheader()
-            for row in rows:
+            for row in new_rows:
                 writer.writerow(dict(row))
 
     def close(self) -> None:

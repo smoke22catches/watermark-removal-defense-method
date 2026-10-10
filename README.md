@@ -86,8 +86,10 @@ See `runs/README.md`. `runs/`, `data/`, and `*.pt` are gitignored.
 ```
 configs/default.yaml   # all hyperparameters
 src/models/            # Encoder, Decoder, ConvBNReLU
-src/attacks/           # DiffJPEG, DistortionBank, RegenerationProxy, PGD, AttackSampler
+src/attacks/           # Training approximations: DistortionBank, RegenerationProxy, PGD
+src/eval/              # Real evaluation transforms + registry (never imports DistortionBank)
 src/engine/            # train_step, curriculum loop, evaluate
+docs/evaluation_protocol.md  # WAVES alignment, sources, deviations
 src/data/              # datasets + dataloaders
 src/losses.py          # BCEWithLogits + LPIPS/MSE
 scripts/               # download_data, train, infer, check_env
@@ -102,25 +104,27 @@ Defaults stay offline-friendly. Flip flags for production paths:
 # Real block-DCT + STE DiffJPEG
 python scripts/train.py ... --set diffjpeg.use_real_diffjpeg=true
 
-# Real SD RegenerationProxy + CLIP text embeds (auto-loads CLIP when placeholder=false)
+# Real SD RegenerationProxy + unconditional empty-prompt embeds
+# (tokenizer/text encoder from the same sd_model_id + sd_revision; TE freed after encode)
 # Requires ~4–6 GB VRAM (SD1.5 VAE+UNet fp16 @ 128², batch 1–2). image_size % 8 == 0.
 # Run `huggingface-cli login` if the model hub requires auth.
 python scripts/train.py ... --device cuda \
   --set regen.use_placeholder=false \
-  --set regen.use_real_text_embeds=true \
-  --set regen.sd_model_id=runwayml/stable-diffusion-v1-5
+  --set regen.sd_model_id=runwayml/stable-diffusion-v1-5 \
+  --set regen.sd_revision=null
 ```
 
 Validate implementations:
 
 ```bash
 python scripts/check_placeholders.py --skip-sd   # DiffJPEG STE + placeholder regen
-python scripts/check_placeholders.py             # also tries real SD/CLIP if CUDA+weights
+python scripts/check_placeholders.py             # also tries real SD + null-text if CUDA+weights
 ```
 
 | Flag | Default | Effect |
 |------|---------|--------|
 | `diffjpeg.use_real_diffjpeg` | `false` | Noise approx → block-DCT + STE JPEG |
 | `regen.use_placeholder` | `true` | Blur/noise proxy → SD VAE/UNet/DDIM |
-| `regen.use_real_text_embeds` | `false` | Zero embeds → CLIP (auto-on when real regen) |
-| `regen.prompt` | `""` | Unconditional null-text conditioning |
+| `regen.sd_model_id` | `runwayml/stable-diffusion-v1-5` | HF repo for VAE/UNet/tokenizer/TE |
+| `regen.sd_revision` | `null` | HF revision (same for all components) |
+| `regen.null_text_cache_dir` | `.cache/null_text_embeds` | Disk cache for empty-prompt embeds |

@@ -23,7 +23,7 @@ from src.attacks.registry import (
     default_strength,
     get_attack,
 )
-from src.attacks.regeneration import build_regen_proxy, build_text_conditioner, make_text_embeds
+from src.attacks.regeneration import build_regen_proxy, make_text_embeds
 from src.data.datasets import build_dataloaders
 from src.engine.evaluate import apply_attack, evaluate_protocol, evaluate_single_image
 from src.engine.train import _build_regen_branch
@@ -249,6 +249,7 @@ def main() -> None:
     regen_cfg = cfg.get("regen", {})
     use_placeholder = bool(regen_cfg.get("use_placeholder", True))
     sd_model_id = str(regen_cfg.get("sd_model_id", "runwayml/stable-diffusion-v1-5"))
+    sd_revision = regen_cfg.get("sd_revision")
     torch_dtype = regen_cfg.get("torch_dtype")
     local_files_only = bool(regen_cfg.get("local_files_only", False))
 
@@ -259,24 +260,21 @@ def main() -> None:
         regen_proxy = build_regen_proxy(
             use_placeholder=use_placeholder,
             sd_model_id=sd_model_id,
+            sd_revision=sd_revision,
             n_steps=int(regen_cfg.get("n_steps", 4)),
             t_start=float(regen_cfg.get("t_start", 0.3)),
             device=device,
             torch_dtype=torch_dtype,
             local_files_only=local_files_only,
+            null_text_cache_dir=regen_cfg.get("null_text_cache_dir", ".cache/null_text_embeds"),
         ).to(device)
 
-    text_conditioner = build_text_conditioner(
-        use_real_text_embeds=bool(regen_cfg.get("use_real_text_embeds", False)),
-        use_placeholder_regen=use_placeholder,
-        sd_model_id=sd_model_id,
-        prompt=str(regen_cfg.get("prompt", "")),
-        device=device,
-        torch_dtype=torch_dtype,
-        local_files_only=local_files_only,
-        text_embed_seq_len=int(regen_cfg.get("text_embed_seq_len", 77)),
-        text_embed_dim=int(regen_cfg.get("text_embed_dim", 768)),
-    )
+    # Null-text embeds live on the proxy (same checkpoint as VAE/UNet).
+    text_conditioner = None
+    if isinstance(cfg, dict) and hasattr(regen_proxy, "sd_model_id"):
+        regen_out = cfg.setdefault("regen", {})
+        regen_out["sd_model_id"] = str(regen_proxy.sd_model_id)
+        regen_out["sd_revision"] = getattr(regen_proxy, "sd_revision", None)
 
     try:
         if args.image:
@@ -411,6 +409,7 @@ def main() -> None:
                 seq_len=int(regen_cfg.get("text_embed_seq_len", 77)),
                 dim=int(regen_cfg.get("text_embed_dim", 768)),
                 conditioner=text_conditioner,
+                regen_proxy=regen_proxy,
             )
             attacked = {}
             for a in attacks[:4]:
@@ -418,7 +417,7 @@ def main() -> None:
                     spec = get_attack("unseen_blur" if a == "unseen" else a)
                 except KeyError:
                     continue
-                if spec.id in ("guided_regen", "adv"):
+                if spec.id == "adv":
                     with torch.enable_grad():
                         attacked[a] = apply_spec(
                             spec, x_w, message=m, decoder=decoder,

@@ -194,9 +194,10 @@ def train(encoder, decoder, dataloader, val_loader, epochs=100, device="cuda"):
     attack_sampler = AttackSampler(distortion_bank, regen_proxy, decoder)
 
     for epoch in range(epochs):
-        # curriculum: збільшуємо частку 𝒜_regen з епохами
+        # curriculum: p_regen↑ with epochs; three probs always sum to 1
         p_regen = min(0.1 + 0.01 * epoch, 0.5)
-        attack_sampler.probs = (max(0.5 - p_regen, 0.2), p_regen, 0.2)
+        p_adv = 0.2
+        attack_sampler.probs = (1.0 - p_regen - p_adv, p_regen, p_adv)
 
         for x, in dataloader:
             x = x.to(device)

@@ -8,16 +8,17 @@ import torch.nn.functional as F
 
 
 def straight_through(x_w: torch.Tensor, x_attacked: torch.Tensor) -> torch.Tensor:
-    """Straight-through estimator: forward uses ``x_attacked``, backward is identity on ``x_w``.
+    """Treat the attack residual as constant: forward ``x_attacked``, backward through ``x_w``.
 
-    Lets decode loss update the encoder even when the attack itself is non-differentiable
-    or intentionally detached (PGD inner loop, no_grad distortion/regen).
+    Used for the PGD branch: ``x_adv = x_w + (x_pgd - x_w).detach()`` so the encoder
+    receives gradient through ``x_w`` while the inner-loop perturbation stays fixed.
+    Distortion / regeneration keep a live autograd path and do not use this helper.
     """
-    return x_w + (x_attacked.detach() - x_w.detach())
+    return x_w + (x_attacked - x_w).detach()
 
 
 def pgd_attack_on_decoder(
-    x_w: torch.Tensor,
+    x_center: torch.Tensor,
     m: torch.Tensor,
     decoder: nn.Module,
     eps: float = 0.02,
@@ -26,17 +27,31 @@ def pgd_attack_on_decoder(
 ) -> torch.Tensor:
     """Projected gradient ascent on BCEWithLogits to fool the decoder.
 
+    Starts from ``x_center`` and projects onto the L-infinity ball of radius ``eps``
+    centered on ``x_center`` (watermarked ``x_w`` for the adv branch, regenerated
+    ``x_r`` for guided regeneration). Inner loop uses ``torch.autograd.grad`` w.r.t.
+    the input only (no decoder ``.grad`` accumulation). Decoder is briefly set to
+    ``eval()`` so BatchNorm running stats are not updated by adversarial samples.
+
     Returns a detached adversarial image. Callers that need encoder gradients should
-    wrap with :func:`straight_through`.
+    wrap with :func:`straight_through` (center = live tensor that should carry grad).
     """
-    x_adv = x_w.clone().detach().requires_grad_(True)
-    for _ in range(steps):
-        logits = decoder(x_adv)
-        loss = F.binary_cross_entropy_with_logits(logits, m)
-        grad = torch.autograd.grad(loss, x_adv)[0]
-        x_adv = x_adv.detach() + alpha * grad.sign()
-        # Bound relative to the live watermarked image (no grad through the box).
-        x_adv = torch.min(torch.max(x_adv, (x_w - eps).detach()), (x_w + eps).detach())
-        x_adv = x_adv.clamp(-1, 1)
-        x_adv.requires_grad_(True)
-    return x_adv.detach()
+    was_training = decoder.training
+    decoder.eval()
+    try:
+        x_adv = x_center.detach().clone().requires_grad_(True)
+        for _ in range(steps):
+            logits = decoder(x_adv)
+            loss = F.binary_cross_entropy_with_logits(logits, m)
+            grad = torch.autograd.grad(loss, x_adv)[0]
+            x_adv = x_adv.detach() + alpha * grad.sign()
+            # Bound relative to the projection center (no grad through the box).
+            x_adv = torch.min(
+                torch.max(x_adv, (x_center - eps).detach()),
+                (x_center + eps).detach(),
+            )
+            x_adv = x_adv.clamp(-1, 1)
+            x_adv.requires_grad_(True)
+        return x_adv.detach()
+    finally:
+        decoder.train(was_training)

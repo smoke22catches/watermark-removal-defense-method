@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import random
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import torch
 from PIL import Image
@@ -166,6 +166,43 @@ def build_dataset(
     return ImageFolderDataset(path, image_size=image_size, num_samples=num_samples)
 
 
+def epoch_seed(seed: int, epoch: int) -> int:
+    """Deterministic seed for epoch ``e`` derived from the run seed."""
+    return int(seed) + int(epoch) * 1_000_003
+
+
+def make_epoch_train_loader(
+    dataset: Dataset,
+    *,
+    batch_size: int,
+    seed: int,
+    epoch: int,
+    num_workers: int = 0,
+) -> DataLoader:
+    """Train loader with shuffle order fixed by ``(seed, epoch)``."""
+    g = torch.Generator()
+    g.manual_seed(epoch_seed(seed, epoch))
+    sampler = torch.utils.data.RandomSampler(dataset, generator=g)
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        sampler=sampler,
+        num_workers=num_workers,
+        drop_last=False,
+    )
+
+
+def skip_batches(loader: DataLoader, n_skip: int) -> Iterator[Any]:
+    """Yield batches from ``loader`` after skipping the first ``n_skip``."""
+    it = iter(loader)
+    for _ in range(max(0, int(n_skip))):
+        try:
+            next(it)
+        except StopIteration:
+            return
+    yield from it
+
+
 def build_dataloaders(
     dataset_name: str,
     data_root: str | Path,
@@ -176,7 +213,13 @@ def build_dataloaders(
     val_fraction: float = 0.1,
     seed: int = 42,
 ) -> Tuple[DataLoader, DataLoader]:
-    """Create train/val dataloaders yielding ``(image,)`` batches."""
+    """Create train/val dataloaders yielding ``(image,)`` batches.
+
+    The returned train loader uses a fixed shuffle for epoch 0. Prefer
+    :func:`make_epoch_train_loader` with the underlying train dataset for
+    per-epoch deterministic order (required for interruptible resume).
+    The train dataset is attached as ``loader.dataset`` for that purpose.
+    """
     full = build_dataset(
         dataset_name, data_root, image_size=image_size, num_samples=num_samples
     )
@@ -196,12 +239,12 @@ def build_dataloaders(
         train_ds = Subset(full, train_idx)
         val_ds = Subset(full, val_idx)
 
-    train_loader = DataLoader(
+    train_loader = make_epoch_train_loader(
         train_ds,
         batch_size=batch_size,
-        shuffle=True,
+        seed=seed,
+        epoch=0,
         num_workers=num_workers,
-        drop_last=False,
     )
     val_loader = DataLoader(
         val_ds,
