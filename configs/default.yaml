@@ -122,6 +122,8 @@ eval:
   diffpure_model_id: CompVis/stable-diffusion-v1-4
   diffpure_steps: 50
   diffpure_t_start: 0.5
+  # true → offline blur+noise stand-in instead of loading eval SD weights (tests / dry-runs).
+  diffpure_use_placeholder: false
   # Seen regen_proxy strengths: t* covering the training range around regen.t_start.
   regen_proxy_t_starts: [0.2, 0.3, 0.4]
   # Seen guided_regen strengths: eps_guided values around regen.eps_guided.

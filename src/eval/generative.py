@@ -33,6 +33,7 @@ class EvalDiffPure(nn.Module):
         t_start: float = 0.5,
         device: str = "cpu",
         local_files_only: bool = False,
+        use_placeholder: bool = False,
     ) -> None:
         super().__init__()
         assert_eval_diffusion_differs(train_model_id, model_id)
@@ -41,9 +42,10 @@ class EvalDiffPure(nn.Module):
         self.n_steps = int(n_steps)
         self.t_start = float(t_start)
         self.device = device
+        self.use_placeholder = bool(use_placeholder)
         self._proxy: Optional[nn.Module] = None
         self._local_files_only = local_files_only
-        self._available = True
+        self._available = not self.use_placeholder
         self._error: Optional[str] = None
 
     def _ensure_loaded(self) -> None:
@@ -118,6 +120,7 @@ def rinse(
 
 
 _COMPRESSAI_CACHE: dict[tuple[str, int], Any] = {}
+_COMPRESSAI_STRIDE = 64
 
 
 def _load_compressai(model: str, quality: int, device: str):
@@ -162,11 +165,18 @@ def compressai_codec(
 
     # CompressAI expects [0, 1].
     x01 = (x.clamp(-1, 1) + 1) * 0.5
+    # Analysis + hyperprior transforms downsample by 64; pad H/W, then crop back.
+    h, w = x01.shape[-2:]
+    pad_h = (-h) % _COMPRESSAI_STRIDE
+    pad_w = (-w) % _COMPRESSAI_STRIDE
+    if pad_h or pad_w:
+        x01 = F.pad(x01, (0, pad_w, 0, pad_h), mode="replicate")
     out = net(x01.to(device))
     if isinstance(out, dict):
         y01 = out["x_hat"]
     else:
         y01 = out[0] if isinstance(out, (tuple, list)) else out
+    y01 = y01[..., :h, :w]
     return (y01 * 2 - 1).clamp(-1, 1).to(dtype=x.dtype, device=x.device)
 
 
@@ -193,4 +203,5 @@ def build_eval_purifier(config: Mapping[str, Any], device: str) -> EvalDiffPure:
         t_start=float(eval_cfg.get("diffpure_t_start", 0.5)),
         device=device,
         local_files_only=bool(regen_cfg.get("local_files_only", False)),
+        use_placeholder=bool(eval_cfg.get("diffpure_use_placeholder", False)),
     )

@@ -152,4 +152,5 @@ python scripts/check_placeholders.py             # also tries real SD + null-tex
 | `regen.use_placeholder` | `true` | Blur/noise proxy → SD VAE/UNet/DDIM |
 | `regen.sd_model_id` | `runwayml/stable-diffusion-v1-5` | HF repo for VAE/UNet/tokenizer/TE |
 | `regen.sd_revision` | `null` | HF revision (same for all components) |
+| `eval.diffpure_use_placeholder` | `false` | Eval DiffPure / rinse SD → offline blur+noise stand-in |
 | `regen.null_text_cache_dir` | `.cache/null_text_embeds` | Disk cache for empty-prompt embeds |

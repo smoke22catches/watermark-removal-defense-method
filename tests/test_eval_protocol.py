@@ -114,7 +114,10 @@ def test_every_runnable_entry_batch_shape() -> None:
             "eps_guided": 0.02,
             "beta_guided": 0.005,
         },
-        "eval": {"diffpure_model_id": DEFAULT_EVAL_DIFFUSION_ID},
+        "eval": {
+            "diffpure_model_id": DEFAULT_EVAL_DIFFUSION_ID,
+            "diffpure_use_placeholder": True,
+        },
         "pgd": {"alpha": 0.005, "steps": 2},
     }
     proxy = build_regen_proxy(

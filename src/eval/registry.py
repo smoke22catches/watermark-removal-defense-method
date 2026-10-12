@@ -329,6 +329,7 @@ _BY_ID["regen"] = _BY_ID["regen_proxy"]
 
 # Lazily constructed eval DiffPure (different model than training).
 _PURIFIER: Optional[EvalDiffPure] = None
+_PURIFIER_KEY: Optional[Tuple[Any, ...]] = None
 # Lazily constructed training-time proxy for eval when caller did not pass one.
 _TRAIN_PROXY: Optional[nn.Module] = None
 
@@ -411,10 +412,22 @@ def protocol_table_rows() -> List[Dict[str, Any]]:
     return rows
 
 
+def _purifier_key(config: Mapping[str, Any], device: str) -> Tuple[Any, ...]:
+    eval_cfg = config.get("eval") or {}
+    return (
+        str(eval_cfg.get("diffpure_model_id", DEFAULT_EVAL_DIFFUSION_ID)),
+        int(eval_cfg.get("diffpure_steps", 50)),
+        bool(eval_cfg.get("diffpure_use_placeholder", False)),
+        device,
+    )
+
+
 def _get_purifier(config: Mapping[str, Any], device: str) -> EvalDiffPure:
-    global _PURIFIER
-    if _PURIFIER is None:
+    global _PURIFIER, _PURIFIER_KEY
+    key = _purifier_key(config, device)
+    if _PURIFIER is None or _PURIFIER_KEY != key:
         _PURIFIER = build_eval_purifier(config, device)
+        _PURIFIER_KEY = key
         regen_cfg = config.get("regen", {})
         train_id = str(regen_cfg.get("sd_model_id", DEFAULT_TRAIN_DIFFUSION_ID))
         assert_eval_diffusion_differs(train_id, _PURIFIER.model_id)
