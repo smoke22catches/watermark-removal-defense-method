@@ -3,15 +3,23 @@
 from __future__ import annotations
 
 import json
-import random
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import torch
 from PIL import Image
-from torch.utils.data import DataLoader, Dataset, Subset
+from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 
+from src.data.splits import (
+    DEFAULT_SPLIT_SEED,
+    DEFAULT_SPLITS_DIR,
+    SplitSpec,
+    generate_synthetic_splits,
+    load_split_spec,
+    resolve_role_root,
+    resolve_split_paths,
+)
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 
@@ -37,7 +45,7 @@ def _collect_images(root: Path) -> List[Path]:
 
 
 class ImageFolderDataset(Dataset):
-    """Flat / nested folder of RGB images; yields ``(image_tensor,)`` to match start.py."""
+    """Flat / nested folder of RGB images; yields ``(image_tensor,)``."""
 
     def __init__(
         self,
@@ -51,6 +59,7 @@ class ImageFolderDataset(Dataset):
         if num_samples is not None:
             self.paths = self.paths[: int(num_samples)]
         self.transform = transform or _default_transform(image_size)
+        self.rel_paths: List[str] = [p.name for p in self.paths]
 
     def __len__(self) -> int:
         return len(self.paths)
@@ -62,20 +71,61 @@ class ImageFolderDataset(Dataset):
         return (tensor,)
 
 
+class ImageListDataset(Dataset):
+    """Dataset from an explicit list of image paths (fixed split)."""
+
+    def __init__(
+        self,
+        paths: Sequence[Path],
+        image_size: int = 128,
+        transform: Optional[transforms.Compose] = None,
+        rel_paths: Optional[Sequence[str]] = None,
+    ) -> None:
+        self.paths = [Path(p) for p in paths]
+        missing = [p for p in self.paths if not p.is_file()]
+        if missing:
+            raise FileNotFoundError(
+                f"{len(missing)} split images missing on disk "
+                f"(e.g. {missing[0]}). Download data or regenerate splits."
+            )
+        self.rel_paths = list(rel_paths) if rel_paths is not None else [p.name for p in self.paths]
+        self.transform = transform or _default_transform(image_size)
+
+    def __len__(self) -> int:
+        return len(self.paths)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor]:
+        img = Image.open(self.paths[idx]).convert("RGB")
+        return (self.transform(img),)
+
+
 class SyntheticImageDataset(Dataset):
     """Random RGB tensors in [-1, 1] for offline smoke tests without real data."""
 
-    def __init__(self, num_samples: int = 32, image_size: int = 128, seed: int = 0) -> None:
-        self.num_samples = num_samples
+    def __init__(
+        self,
+        num_samples: int = 32,
+        image_size: int = 128,
+        seed: int = 0,
+        indices: Optional[Sequence[int]] = None,
+    ) -> None:
         self.image_size = image_size
-        g = torch.Generator().manual_seed(seed)
-        self._data = torch.rand(num_samples, 3, image_size, image_size, generator=g) * 2 - 1
+        # Full pool is always generated from a fixed seed so split indices are stable.
+        g = torch.Generator().manual_seed(int(seed))
+        pool_n = int(num_samples) if indices is None else max(int(num_samples), max(indices) + 1)
+        self._pool = torch.rand(pool_n, 3, image_size, image_size, generator=g) * 2 - 1
+        if indices is None:
+            self._indices = list(range(int(num_samples)))
+        else:
+            self._indices = [int(i) for i in indices]
+        self.num_samples = len(self._indices)
+        self.rel_paths = [f"synthetic/{i:05d}" for i in self._indices]
 
     def __len__(self) -> int:
         return self.num_samples
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor]:
-        return (self._data[idx],)
+        return (self._pool[self._indices[idx]],)
 
 
 def load_manifest(data_root: str | Path) -> Dict[str, Any]:
@@ -86,59 +136,100 @@ def load_manifest(data_root: str | Path) -> Dict[str, Any]:
         return json.load(f)
 
 
-def resolve_dataset_path(data_root: str | Path, name: str) -> Optional[Path]:
-    """Resolve a dataset name via manifest or conventional folder layout."""
-    data_root = Path(data_root)
-    name = name.lower()
-    if name == "synthetic":
-        return None
+def resolve_dataset_path(
+    data_root: str | Path,
+    name: str,
+    role: str = "train",
+) -> Optional[Path]:
+    """Resolve a dataset folder for ``role`` in {train, val, test}.
 
-    manifest = load_manifest(data_root)
-    entry = manifest.get("datasets", {}).get(name)
-    if entry and entry.get("path"):
-        p = Path(entry["path"])
-        if p.exists():
-            return p
-
-    # Conventional layouts written by scripts/download_data.py
-    candidates = {
-        "coco": [
-            data_root / "coco" / "val2017",
-            data_root / "coco" / "val2014",
-            data_root / "coco",
-        ],
-        "div2k": [
-            data_root / "div2k" / "DIV2K_valid_HR",
-            data_root / "div2k" / "DIV2K_train_HR",
-            data_root / "div2k",
-        ],
-        "imagenette": [
-            data_root / "imagenette" / "imagenette2-320" / "val",
-            data_root / "imagenette" / "val",
-            data_root / "imagenette",
-        ],
-        "imagenet": [
-            data_root / "imagenet" / "val",
-            data_root / "imagenet",
-        ],
-        "clic": [
-            data_root / "clic" / "professional",
-            data_root / "clic" / "mobile",
-            data_root / "clic",
-        ],
-    }
-    for c in candidates.get(name, [data_root / name]):
-        if c.exists() and _collect_images(c):
-            return c
-    return None
+    Train and test never resolve to the same folder by default for COCO / DIV2K /
+    Imagenette. Prefer :func:`src.data.splits.resolve_role_root`.
+    """
+    return resolve_role_root(data_root, name, role)
 
 
 def list_available_datasets(data_root: str | Path) -> List[str]:
     names = ["synthetic"]
     for name in ("coco", "div2k", "imagenette", "imagenet", "clic"):
-        if resolve_dataset_path(data_root, name) is not None:
+        if resolve_dataset_path(data_root, name, role="train") is not None:
             names.append(name)
     return names
+
+
+def _synthetic_indices_from_rel(rel_paths: Sequence[str]) -> List[int]:
+    out: List[int] = []
+    for rel in rel_paths:
+        # synthetic/00042
+        stem = Path(rel).name
+        out.append(int(stem))
+    return out
+
+
+def ensure_split_spec(
+    dataset: str,
+    *,
+    data_root: str | Path = "./data",
+    splits_dir: str | Path = DEFAULT_SPLITS_DIR,
+    split_seed: int = DEFAULT_SPLIT_SEED,
+    num_samples: Optional[int] = None,
+) -> SplitSpec:
+    """Load split lists; auto-create synthetic splits if missing."""
+    dataset = dataset.lower()
+    try:
+        return load_split_spec(dataset, data_root=data_root, splits_dir=splits_dir)
+    except FileNotFoundError:
+        if dataset == "synthetic":
+            n = int(num_samples) if num_samples is not None else 64
+            return generate_synthetic_splits(
+                Path(data_root),
+                Path(splits_dir),
+                split_seed=int(split_seed),
+                num_samples=n,
+            )
+        raise
+
+
+def build_split_dataset(
+    dataset: str,
+    role: str,
+    *,
+    data_root: str | Path = "./data",
+    image_size: int = 128,
+    splits_dir: str | Path = DEFAULT_SPLITS_DIR,
+    split_seed: int = DEFAULT_SPLIT_SEED,
+    num_samples: Optional[int] = None,
+    split_spec: Optional[SplitSpec] = None,
+) -> Tuple[Dataset, SplitSpec]:
+    """Build a dataset for one role from fixed split lists."""
+    dataset = dataset.lower()
+    role = role.lower()
+    spec = split_spec or ensure_split_spec(
+        dataset,
+        data_root=data_root,
+        splits_dir=splits_dir,
+        split_seed=split_seed,
+        num_samples=num_samples,
+    )
+    rel = {"train": spec.train_paths, "val": spec.val_paths, "test": spec.test_paths}[role]
+    if num_samples is not None:
+        rel = list(rel)[: int(num_samples)]
+
+    if dataset == "synthetic":
+        # Pool size from meta or max index + 1.
+        max_idx = max(_synthetic_indices_from_rel(spec.train_paths + spec.val_paths + spec.test_paths), default=0)
+        pool_n = max(max_idx + 1, int(num_samples or 64))
+        ds: Dataset = SyntheticImageDataset(
+            num_samples=pool_n,
+            image_size=image_size,
+            seed=0,  # fixed pool; split indices select rows
+            indices=_synthetic_indices_from_rel(rel),
+        )
+        return ds, spec
+
+    abs_paths = resolve_split_paths(rel, data_root)
+    ds = ImageListDataset(abs_paths, image_size=image_size, rel_paths=rel)
+    return ds, spec
 
 
 def build_dataset(
@@ -148,22 +239,24 @@ def build_dataset(
     num_samples: Optional[int] = None,
     split: str = "train",
 ) -> Dataset:
-    """Build a dataset by name. Falls back to synthetic if files are missing."""
+    """Build a dataset by name. Falls back to synthetic if files/splits are missing."""
     name = name.lower()
-    if name == "synthetic":
-        n = num_samples if num_samples is not None else 64
-        return SyntheticImageDataset(num_samples=n, image_size=image_size)
-
-    path = resolve_dataset_path(data_root, name)
-    if path is None:
+    try:
+        ds, _ = build_split_dataset(
+            name,
+            split,
+            data_root=data_root,
+            image_size=image_size,
+            num_samples=num_samples,
+        )
+        return ds
+    except FileNotFoundError:
         print(
-            f"[data] Dataset '{name}' not found under {data_root}; "
-            f"using synthetic images. Run scripts/download_data.py --dataset {name}"
+            f"[data] Dataset '{name}' split '{split}' not available under {data_root}; "
+            f"using synthetic. Run scripts/download_data.py and scripts/make_splits.py."
         )
         n = num_samples if num_samples is not None else 64
-        return SyntheticImageDataset(num_samples=n, image_size=image_size)
-
-    return ImageFolderDataset(path, image_size=image_size, num_samples=num_samples)
+        return SyntheticImageDataset(num_samples=n, image_size=image_size, seed=0)
 
 
 def epoch_seed(seed: int, epoch: int) -> int:
@@ -212,32 +305,62 @@ def build_dataloaders(
     num_samples: Optional[int] = None,
     val_fraction: float = 0.1,
     seed: int = 42,
-) -> Tuple[DataLoader, DataLoader]:
-    """Create train/val dataloaders yielding ``(image,)`` batches.
+    splits_dir: str | Path = DEFAULT_SPLITS_DIR,
+    split_seed: int = DEFAULT_SPLIT_SEED,
+    include_test: bool = False,
+) -> Tuple[DataLoader, DataLoader] | Tuple[DataLoader, DataLoader, DataLoader, Dict[str, Any]]:
+    """Create loaders from fixed split lists (independent of ``seed``).
 
-    The returned train loader uses a fixed shuffle for epoch 0. Prefer
-    :func:`make_epoch_train_loader` with the underlying train dataset for
-    per-epoch deterministic order (required for interruptible resume).
-    The train dataset is attached as ``loader.dataset`` for that purpose.
+    ``seed`` only affects the epoch shuffle order of the train loader, not membership.
+    ``val_fraction`` is ignored when split files exist (kept for CLI compatibility).
+
+    When ``include_test=True``, also returns ``(train, val, test, split_info)``.
     """
-    full = build_dataset(
-        dataset_name, data_root, image_size=image_size, num_samples=num_samples
-    )
-    n = len(full)
-    if n == 0:
-        raise RuntimeError(f"Empty dataset for '{dataset_name}'")
+    _ = val_fraction  # membership comes from split files
+    dataset_name = dataset_name.lower()
+    try:
+        spec = ensure_split_spec(
+            dataset_name,
+            data_root=data_root,
+            splits_dir=splits_dir,
+            split_seed=split_seed,
+            num_samples=num_samples,
+        )
+    except FileNotFoundError:
+        print(
+            f"[data] No fixed splits for '{dataset_name}'; falling back to synthetic splits."
+        )
+        spec = generate_synthetic_splits(
+            Path(data_root),
+            Path(splits_dir),
+            split_seed=int(split_seed),
+            num_samples=int(num_samples) if num_samples is not None else 64,
+        )
+        dataset_name = "synthetic"
 
-    indices = list(range(n))
-    rng = random.Random(seed)
-    rng.shuffle(indices)
-    n_val = max(1, int(n * val_fraction)) if n > 1 else 0
-    if n_val == 0:
-        train_ds, val_ds = full, full
-    else:
-        val_idx = indices[:n_val]
-        train_idx = indices[n_val:] or indices[:1]
-        train_ds = Subset(full, train_idx)
-        val_ds = Subset(full, val_idx)
+    train_ds, spec = build_split_dataset(
+        dataset_name,
+        "train",
+        data_root=data_root,
+        image_size=image_size,
+        splits_dir=splits_dir,
+        split_seed=split_seed,
+        num_samples=num_samples,
+        split_spec=spec,
+    )
+    val_ds, spec = build_split_dataset(
+        dataset_name,
+        "val",
+        data_root=data_root,
+        image_size=image_size,
+        splits_dir=splits_dir,
+        split_seed=split_seed,
+        num_samples=None,
+        split_spec=spec,
+    )
+    if len(val_ds) == 0:
+        # Degenerate tiny synthetic: reuse a one-sample view of train for model selection.
+        val_ds = train_ds
 
     train_loader = make_epoch_train_loader(
         train_ds,
@@ -253,4 +376,85 @@ def build_dataloaders(
         num_workers=num_workers,
         drop_last=False,
     )
-    return train_loader, val_loader
+    info = spec.as_meta()
+    info["train_list"] = list(spec.train_paths)
+    info["val_list"] = list(spec.val_paths)
+    info["test_list"] = list(spec.test_paths)
+
+    if not include_test:
+        # Attach for callers that still unpack two loaders.
+        train_loader.split_info = info  # type: ignore[attr-defined]
+        val_loader.split_info = info  # type: ignore[attr-defined]
+        return train_loader, val_loader
+
+    test_ds, spec = build_split_dataset(
+        dataset_name,
+        "test",
+        data_root=data_root,
+        image_size=image_size,
+        splits_dir=splits_dir,
+        split_seed=split_seed,
+        num_samples=None,
+        split_spec=spec,
+    )
+    test_loader = DataLoader(
+        test_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        drop_last=False,
+    )
+    if len(test_ds) < 5000 and dataset_name != "synthetic":
+        print(
+            f"[WARNING] test split has {len(test_ds)} < 5000 images; "
+            "FID and TPR@0.1%FPR cannot be estimated reliably."
+        )
+    return train_loader, val_loader, test_loader, info
+
+
+def build_test_loader(
+    dataset_name: str,
+    data_root: str | Path,
+    *,
+    image_size: int = 128,
+    batch_size: int = 4,
+    num_workers: int = 0,
+    splits_dir: str | Path = DEFAULT_SPLITS_DIR,
+    split_seed: int = DEFAULT_SPLIT_SEED,
+    num_samples: Optional[int] = None,
+) -> Tuple[DataLoader, Dict[str, Any]]:
+    """Inference-only loader over the fixed test split."""
+    dataset_name = dataset_name.lower()
+    spec = ensure_split_spec(
+        dataset_name,
+        data_root=data_root,
+        splits_dir=splits_dir,
+        split_seed=split_seed,
+        num_samples=num_samples,
+    )
+    test_ds, spec = build_split_dataset(
+        dataset_name,
+        "test",
+        data_root=data_root,
+        image_size=image_size,
+        splits_dir=splits_dir,
+        split_seed=split_seed,
+        num_samples=num_samples,
+        split_spec=spec,
+    )
+    if len(test_ds) < 5000 and dataset_name != "synthetic":
+        print(
+            f"[WARNING] clean/test set has {len(test_ds)} < 5000 images; "
+            "0.1% FPR and FID cannot be estimated reliably."
+        )
+    loader = DataLoader(
+        test_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        drop_last=False,
+    )
+    info = spec.as_meta()
+    info["train_list"] = list(spec.train_paths)
+    info["test_list"] = list(spec.test_paths)
+    return loader, info

@@ -28,11 +28,13 @@ uint8 round-trip (`src/eval/quantize.py`), matching published 8-bit storage.
 | unseen_blur | WAVES | 0.8, 1.5, 3.0 σ | no | Separable Gaussian blur |
 | jpeg | WAVES | 90, 70, 50, 30, 10 | yes | **PIL** encode/decode (not training DiffJPEG) |
 | downsample | own | 2×, 4× | yes | Avg-pool + bilinear upsample |
-| diffpure | diffusers | t_start 0.2, 0.4, 0.6 | no | Full-step purification with **`eval.diffpure_model_id`** (default `CompVis/stable-diffusion-v1-4`), asserted ≠ `regen.sd_model_id` (default `runwayml/stable-diffusion-v1-5`). Offline stand-in: blur+noise stack when weights missing |
-| rinse_2 | WAVES | 2 | no | DiffPure ×2 (WAVES Regen-2xDiff style) |
-| rinse_4 | WAVES | 4 | no | DiffPure ×4 |
-| bmshj2018 | compressai | quality 1,3,5,8 | no | compressai `bmshj2018_*`; offline spatial bottleneck if package missing |
-| cheng2020 | compressai | quality 1,3,5,6 | no | compressai `cheng2020_*`; offline stand-in if missing |
+| regen_proxy | own | t* 0.2, 0.3, 0.4 | yes | Same few-step DDIM reconstruction proxy as training (`regen.sd_model_id` / revision); `k=black`; `torch.no_grad()` at eval. Alias: `regen`. |
+| guided_regen | own | ε_g 0.01, 0.02, 0.04 | yes | regen_proxy then guided PGD on the evaluated decoder (`k=white`). Baselines use their own decoder. |
+| diffpure | diffusers | t_start 0.2, 0.4, 0.6 | no | Full-step purification with **`eval.diffpure_model_id`** (default `CompVis/stable-diffusion-v1-4`), asserted ≠ `regen.sd_model_id` (default `runwayml/stable-diffusion-v1-5`). `k=black`. Offline stand-in: blur+noise stack when weights missing |
+| rinse_2 | WAVES | 2 | no | DiffPure ×2 (WAVES Regen-2xDiff style); `k=black` |
+| rinse_4 | WAVES | 4 | no | DiffPure ×4; `k=black` |
+| bmshj2018 | compressai | quality 1,3,5,8 | no | compressai `bmshj2018_*`; `k=black`; offline spatial bottleneck if package missing |
+| cheng2020 | compressai | quality 1,3,5,6 | no | compressai `cheng2020_*`; `k=black`; offline stand-in if missing |
 | adv | WAVES | 2/255 … 8/255 | yes | PGD on decoder (WAVES AdvEmbed ε grid); uses `src.attacks.adversarial` (not DistortionBank) |
 | semantic_regen | semanticregen | — | no | **not_evaluated**: official repo https://github.com/KrtiT/semanticRegen is a Jupyter notebook pipeline (MIT), not an importable API. No invented reimplementation |
 

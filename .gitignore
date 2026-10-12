@@ -1,5 +1,11 @@
+# Downloaded baseline weights (StegaStamp archive, etc.)
+weights/
+
 # Data and checkpoints (large / regenerable)
-data/
+# Ignore dataset blobs under data/, but keep fixed split lists versioned.
+data/*
+!data/splits/
+!data/splits/**
 !src/data/
 *.pt
 *.pth

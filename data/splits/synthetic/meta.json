@@ -1,0 +1,20 @@
+{
+  "counts": {
+    "test": 12,
+    "train": 46,
+    "val": 6
+  },
+  "data_root": "data",
+  "dataset": "synthetic",
+  "extra": {
+    "num_samples": 64,
+    "test_fraction": 0.2,
+    "val_fraction": 0.1
+  },
+  "split_hashes": {
+    "test.txt": "2d0eff19428b3c1c8fe122bca1f784728df5d10eaf5c5ee92a1b17ccbd51de85",
+    "train.txt": "0ab4548a679a8b486ad065ddfed567c017e243e0f01399566701b3602fd2ff97",
+    "val.txt": "a440a19087f932c2a5e73d2be1f2e0aa0a7fd41715cb3d950e0fd6d1876b7044"
+  },
+  "split_seed": 20241010
+}

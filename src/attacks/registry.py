@@ -22,6 +22,8 @@ from src.eval.registry import (  # noqa: F401
     get_attack,
     list_attack_ids,
     protocol_table_rows,
+    regeneration_seen_unseen,
+    resolve_strengths,
 )
 from src.eval.transforms import gaussian_blur
 
@@ -105,27 +107,32 @@ SCHEME_INFO: Dict[str, Dict[str, object]] = {
         "train_resolution": None,
         "weights": "local",
         "available": True,
+        "not_applicable": False,
     },
     "stegastamp": {
         "label_uk": "StegaStamp",
         "payload_bits": 100,
         "train_resolution": 400,
         "weights": "official",
-        "available": False,
+        # Runtime availability is decided by src.baselines.factory.load_baseline.
+        "available": None,
+        "not_applicable": False,
     },
     "trustmark": {
         "label_uk": "TrustMark",
         "payload_bits": 100,
         "train_resolution": 256,
         "weights": "official",
-        "available": False,
+        "available": None,
+        "not_applicable": False,
     },
     "vine": {
         "label_uk": "VINE",
         "payload_bits": 100,
         "train_resolution": 256,
         "weights": "official",
-        "available": False,
+        "available": None,
+        "not_applicable": False,
     },
     "stable_signature": {
         "label_uk": "Stable Signature",
@@ -133,13 +140,30 @@ SCHEME_INFO: Dict[str, Dict[str, object]] = {
         "train_resolution": 512,
         "weights": "official",
         "available": False,
+        "not_applicable": True,
+        "reason": (
+            "Watermarks images during generation; cannot embed into an arbitrary "
+            "existing image (out of scope for this post-hoc comparison)."
+        ),
+    },
+    "tree_ring": {
+        "label_uk": "Tree-Ring",
+        "payload_bits": 0,
+        "train_resolution": 512,
+        "weights": "official",
+        "available": False,
+        "not_applicable": True,
+        "reason": (
+            "Watermarks images during generation (diffusion Fourier rings); "
+            "not a post-hoc embedder for arbitrary existing images."
+        ),
     },
 }
 
+# Comparative tables (D1/E1): post-hoc schemes only (generation-time methods excluded).
 SCHEME_ORDER: Tuple[str, ...] = (
     "ours",
     "stegastamp",
     "trustmark",
     "vine",
-    "stable_signature",
 )

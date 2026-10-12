@@ -126,8 +126,8 @@ SCHEME_STYLE: Dict[str, Dict[str, Any]] = {
 
 BRANCH_STYLE = {
     "ddim_proxy": {"color": "#0072B2", "marker": "o", "label": "DDIM-проксі"},
-    "blur_surrogate": {"color": "#E69F00", "marker": "s", "label": "Розмиття-сурогат"},
-    "none": {"color": "#999999", "marker": "x", "label": "Без регенерації"},
+    "blur_surrogate": {"color": "#E69F00", "marker": "s", "label": "Сурогат-розмиття"},
+    "none": {"color": "#999999", "marker": "x", "label": "Без регенераційної гілки"},
 }
 
 CLASS_ORDER = (
@@ -149,7 +149,8 @@ D1_COLUMNS = (
     "sem",
 )
 MIN_SEEDS = 3
-FIGURE_IDS = ("d4", "c3", "g1", "f2", "b1", "d1", "e1", "c1", "c2", "h1")
+FIGURE_IDS = ("d4", "c3", "g1", "f2", "f3", "b1", "d1", "e1", "c1", "c2", "h1")
+F2_BRANCHES = ("ddim_proxy", "blur_surrogate", "none")
 F2_IGNORE = {
     "run_name",
     "seed",
@@ -160,6 +161,18 @@ F2_IGNORE = {
     "num_workers",
     "regen_branch",
     "blur_sigma",
+}
+# Proxy-steps sweep may use a reduced epoch budget vs the main runs.
+F3_IGNORE = {
+    "run_name",
+    "seed",
+    "resume",
+    "device",
+    "runs_root",
+    "export_algorithm",
+    "num_workers",
+    "epochs",
+    "regen.n_steps",
 }
 
 
@@ -852,87 +865,267 @@ def generate_d4(
     return artifacts
 
 
-def generate_c3(runs: Sequence[RunBundle], out_dir: Path, **_: Any) -> Dict[str, Any]:
-    """Unified evaluation protocol table from the attack registry."""
+# Transforms whose ``strength`` is a genuine configured L∞ ball radius.
+_C3_CONFIGURED_LINF_IDS = frozenset({"adv", "guided_regen"})
+
+
+def _c3_strength_key(strength: Any) -> float:
+    """Stable key so CSV round-trips match registry floats (e.g. 4/255)."""
+    return round(float(strength), 10)
+
+
+def _fmt_ci_meas(mean: float, half: float, n: int) -> str:
+    """CI formatter for measured budgets (more digits than bit-accuracy)."""
+    if n <= 0 or not np.isfinite(mean):
+        return UK["not_eval"]
+    if n == 1 or not np.isfinite(half):
+        return f"{mean:.4g}"
+    return f"{mean:.4g}±{half:.4g}"
+
+
+def _c3_collect_measurements(
+    df: pd.DataFrame,
+    scheme: str,
+) -> Dict[Tuple[str, float], Dict[str, List[float]]]:
+    """Map (attack, strength) → metric → list of per-seed values.
+
+    Uses the metric names written by ``evaluate_protocol``: ``pert_l2``,
+    ``pert_linf``, ``pert_lpips``.
+    """
+    out: Dict[Tuple[str, float], Dict[str, List[float]]] = {}
+    if df.empty or "metric_name" not in df.columns:
+        return out
+    panel = df
+    if "scheme" in panel.columns:
+        panel = panel[panel["scheme"].astype(str) == str(scheme)]
+    if panel.empty:
+        return out
+    keep = panel[panel["metric_name"].isin(["pert_l2", "pert_linf", "pert_lpips"])].copy()
+    if keep.empty:
+        return out
+    keep["metric_value_num"] = keep["metric_value"].map(parse_metric_value)
+    keep = keep[_numeric_mask(keep["metric_value_num"])]
+    if keep.empty:
+        return out
+    # One value per (seed, attack, strength, metric) — already a per-run mean over samples.
+    for (attack, strength, metric), g in keep.groupby(
+        ["attack", "strength", "metric_name"], sort=False
+    ):
+        try:
+            s_key = _c3_strength_key(strength)
+        except (TypeError, ValueError):
+            continue
+        key = (str(attack), s_key)
+        bucket = out.setdefault(key, {"pert_l2": [], "pert_linf": [], "pert_lpips": []})
+        if metric not in bucket:
+            continue
+        # Prefer one value per seed (mean if duplicates).
+        if "seed" in g.columns:
+            for _, sg in g.groupby("seed"):
+                bucket[metric].append(float(sg["metric_value_num"].mean()))
+        else:
+            bucket[metric].extend(float(v) for v in g["metric_value_num"].tolist())
+    return out
+
+
+def _c3_sample_and_seed_counts(
+    runs: Sequence[RunBundle], scheme: str, meas: Mapping[Tuple[str, float], Any]
+) -> Tuple[int, int]:
+    """Return ``(n_samples_estimate, n_seeds)`` for the caption."""
+    seeds: set = set()
+    samples_per_run: List[int] = []
+    for r in runs:
+        if str(r.scheme) != str(scheme):
+            continue
+        if r.results is None or r.results.empty:
+            continue
+        has_pert = False
+        if "metric_name" in r.results.columns:
+            has_pert = bool(
+                r.results["metric_name"].isin(["pert_l2", "pert_linf", "pert_lpips"]).any()
+            )
+        if not has_pert:
+            continue
+        seeds.add(str(r.seed))
+        counts = (r.meta.get("splits") or {}).get("counts") or {}
+        n = counts.get("test")
+        if n is None:
+            n = r.config.get("num_samples")
+        if n is not None:
+            try:
+                samples_per_run.append(int(n))
+            except (TypeError, ValueError):
+                pass
+    n_seeds = len(seeds)
+    if not n_seeds and meas:
+        # Fall back: count distinct seeds implied by measurement lists.
+        n_seeds = max((len(v.get("pert_l2") or []) for v in meas.values()), default=0)
+    if samples_per_run:
+        # Typical test-set size × seeds (same split reused across seeds).
+        n_per = int(round(float(np.median(samples_per_run))))
+        n_samples = n_per * max(n_seeds, 1)
+    else:
+        n_samples = 0
+    return n_samples, n_seeds
+
+
+def generate_c3(
+    runs: Sequence[RunBundle],
+    out_dir: Path,
+    *,
+    c3_scheme: str = "ours",
+    **_: Any,
+) -> Dict[str, Any]:
+    """Protocol table with *measured* perturbation / LPIPS budgets from results.csv."""
     configure_style()
+    scheme = str(c3_scheme or "ours")
+    df = _eval_frame(runs) if runs else pd.DataFrame()
+    meas = _c3_collect_measurements(df, scheme)
+    n_samples, n_seeds = _c3_sample_and_seed_counts(runs or [], scheme, meas)
+
     headers = [
         UK["attack"],
         UK["attack_class"],
-        "Джерело",
-        "Імплементація",
-        UK["attack_strength"],
-        r"$\varepsilon$",
-        r"$\delta$",
         UK["knowledge"],
         "Вид",
-        "Статус",
+        UK["attack_strength"],
+        r"$\|T(x_w)-x_w\|_2$",
+        r"$\|T(x_w)-x_w\|_\infty$",
+        r"LPIPS$(x_w,T(x_w))$",
+        "Заданий бюджет",
     ]
-    rows = []
     csv_headers = [
-        "attack", "class", "source", "implementation", "strengths", "epsilon", "delta",
-        "knowledge_level", "seen_in_training", "not_evaluated",
+        "attack",
+        "class",
+        "knowledge_level",
+        "seen_in_training",
+        "strength",
+        "pert_l2",
+        "pert_linf",
+        "pert_lpips",
+        "configured_linf_budget",
+        "scheme",
     ]
-    csv_rows = []
+    rows: List[List[str]] = []
+    csv_rows: List[List[Any]] = []
+    k_uk = {"black": "чорний", "grey": "сірий", "white": "білий"}
+
     for spec in ATTACK_REGISTRY:
         seen = UK["seen"] if spec.seen_in_training else UK["unseen"]
-        k = {"black": "чорний", "grey": "сірий", "white": "білий"}[spec.knowledge_level]
-        strengths = ", ".join(str(s) for s in spec.strengths)
-        status = "not_evaluated" if getattr(spec, "not_evaluated", False) else "active"
-        source = getattr(spec, "source", "own")
-        rows.append(
-            [
-                spec.label_uk,
-                CLASS_LABEL_UK.get(spec.cls, spec.cls),
-                source.replace("_", r"\_"),
-                spec.implementation.replace("_", r"\_"),
-                strengths,
-                f"{spec.epsilon:g}",
-                f"{spec.delta:g}",
-                k,
-                seen,
-                status.replace("_", r"\_"),
-            ]
-        )
-        csv_rows.append(
-            [
-                spec.id,
-                spec.cls,
-                source,
-                spec.implementation,
-                strengths,
-                spec.epsilon,
-                spec.delta,
-                spec.knowledge_level,
-                spec.seen_in_training,
-                getattr(spec, "not_evaluated", False),
-            ]
-        )
+        k_label = k_uk.get(spec.knowledge_level, spec.knowledge_level)
+        strengths = list(spec.strengths) if spec.strengths else (0.0,)
+        for strength in strengths:
+            s_key = _c3_strength_key(strength)
+            bucket = meas.get((spec.id, s_key), {})
+            m2, h2, n2 = mean_ci95(bucket.get("pert_l2") or [])
+            mi, hi, ni = mean_ci95(bucket.get("pert_linf") or [])
+            ml, hl, nl = mean_ci95(bucket.get("pert_lpips") or [])
+            cell_l2 = _fmt_ci_meas(m2, h2, n2)
+            cell_inf = _fmt_ci_meas(mi, hi, ni)
+            cell_lp = _fmt_ci_meas(ml, hl, nl)
+            if spec.id in _C3_CONFIGURED_LINF_IDS:
+                # Strength *is* the configured L∞ radius for PGD / guided regen.
+                configured = f"$\\varepsilon_\\infty={s_key:g}$"
+                configured_csv = s_key
+            else:
+                configured = "—"
+                configured_csv = ""
+            rows.append(
+                [
+                    spec.label_uk,
+                    CLASS_LABEL_UK.get(spec.cls, spec.cls),
+                    k_label,
+                    seen,
+                    f"{s_key:g}",
+                    cell_l2.replace("±", r"${\pm}$") if "±" in cell_l2 else cell_l2,
+                    cell_inf.replace("±", r"${\pm}$") if "±" in cell_inf else cell_inf,
+                    cell_lp.replace("±", r"${\pm}$") if "±" in cell_lp else cell_lp,
+                    configured,
+                ]
+            )
+            csv_rows.append(
+                [
+                    spec.id,
+                    spec.cls,
+                    spec.knowledge_level,
+                    spec.seen_in_training,
+                    s_key,
+                    cell_l2,
+                    cell_inf,
+                    cell_lp,
+                    configured_csv,
+                    scheme,
+                ]
+            )
+
     artifacts = _write_table(
-        out_dir, "c3", headers, rows, colspec="lll p{2.8cm}p{2.4cm}ccccc",
-        title="Єдиний протокол оцінювання",
+        out_dir,
+        "c3",
+        headers,
+        rows,
+        colspec="llllc cccc",
+        title="Єдиний протокол оцінювання (виміряні бюджети)",
     )
-    # overwrite csv with machine-readable ids
-    pd.DataFrame(csv_rows, columns=csv_headers).to_csv(out_dir / "c3.csv", index=False, encoding="utf-8")
-    n = _n_seeds(_eval_frame(runs)) if runs else 0
-    datasets = sorted({r.dataset for r in runs if r.dataset})
+    pd.DataFrame(csv_rows, columns=csv_headers).to_csv(
+        out_dir / "c3.csv", index=False, encoding="utf-8"
+    )
+    datasets = sorted({r.dataset for r in runs if r.dataset}) if runs else []
+    scheme_label = _scheme_label(scheme)
+    if n_samples > 0 and n_seeds > 0:
+        meas_note = (
+            f"Виміри для схеми «{scheme_label}» ($\\texttt{{{scheme}}}$): "
+            f"{n_samples} зразків, $n={n_seeds}$ {UK['seeds']} "
+            f"({UK['mean_ci']} за seed)."
+        )
+    elif n_seeds > 0:
+        meas_note = (
+            f"Виміри для схеми «{scheme_label}» ($\\texttt{{{scheme}}}$): "
+            f"$n={n_seeds}$ {UK['seeds']} ({UK['mean_ci']})."
+        )
+    else:
+        meas_note = (
+            f"Виміряні стовпці: «{UK['not_eval']}» "
+            f"(немає evaluation-запусків для схеми \\texttt{{{scheme}}})."
+        )
     cap = (
-        f"\\caption{{Єдиний протокол оцінювання. Для кожної атаки: клас, імплементація, "
-        f"рівні сили, бюджет збурення $\\varepsilon$, бюджет якості $\\delta$, "
-        f"рівень обізнаності $k$ та позначка «{UK['seen']}» / «{UK['unseen']}». "
-        f"Набір даних: {', '.join(datasets) or 'протокол (реєстр)'}. "
-        f"$n={n}$ {UK['seeds']} (таблиця не агрегує виміри, лише протокол).}}"
+        f"\\caption{{Єдиний протокол оцінювання. Рядок — пара (трансформація, сила). "
+        f"Стовпці: клас, рівень обізнаності $k$, вид (відома/невідома), сила, "
+        f"виміряні $\\|T(x_w)-x_w\\|_2$, $\\|T(x_w)-x_w\\|_\\infty$ та "
+        f"LPIPS$(x_w,T(x_w))$ (імена метрик як у \\texttt{{results.csv}}: "
+        f"\\texttt{{pert\\_l2}}, \\texttt{{pert\\_linf}}, \\texttt{{pert\\_lpips}}). "
+        f"«Заданий бюджет» — сконфігурований $L_\\infty$-радіус лише для "
+        f"градієнтних / керованих атак (\\texttt{{adv}}, \\texttt{{guided\\_regen}}). "
+        f"{meas_note} "
+        f"Набір даних: {', '.join(datasets) or 'протокол (реєстр)'}.}}"
     )
     artifacts["caption"] = str(_write_caption(out_dir, "c3", cap))
+    artifacts["scheme"] = scheme
+    artifacts["n_seeds"] = n_seeds
+    artifacts["n_samples"] = n_samples
     return artifacts
 
 
 def generate_g1(runs: Sequence[RunBundle], out_dir: Path, **_: Any) -> Dict[str, Any]:
-    """Held-out (unseen) attack results + seen→unseen drop."""
+    """Held-out (unseen) attack results + seen→unseen drop.
+
+    Regeneration class must expose both a non-empty seen group (``regen_proxy``,
+    ``guided_regen``) and a non-empty unseen group (DiffPure / rinse / codecs).
+    """
     configure_style()
     df = _eval_frame(runs)
     wide = _wide_quality(df)
     n_seeds = _n_seeds(df)
-    unseen_ids = [s.id for s in ATTACK_REGISTRY if not s.seen_in_training]
+    from src.eval.registry import regeneration_seen_unseen
+
+    regen_groups = regeneration_seen_unseen()
+    regen_seen_ids = list(regen_groups["seen"])
+    regen_unseen_ids = list(regen_groups["unseen"])
+    if not regen_seen_ids or not regen_unseen_ids:
+        raise RuntimeError(
+            "G1 requires non-empty seen and unseen groups in the regeneration class; "
+            f"got seen={regen_seen_ids}, unseen={regen_unseen_ids}"
+        )
+    unseen_ids = [s.id for s in ATTACK_REGISTRY if not s.seen_in_training and not s.not_evaluated]
     fig, axes = plt.subplots(1, 2, figsize=(7.2, 3.4), gridspec_kw={"width_ratios": [2.2, 1]})
     ax, ax2 = axes
     _warn_seeds(n_seeds, "g1", fig=fig)
@@ -1001,11 +1194,13 @@ def generate_g1(runs: Sequence[RunBundle], out_dir: Path, **_: Any) -> Dict[str,
     ax.grid(True, axis="y", alpha=0.3)
     ax.legend(fontsize=6, ncol=1, loc="upper right")
 
-    # seen → unseen drop
+    # seen → unseen drop (all classes) + regeneration-class drop
     drop_means, drop_errs, drop_labels = [], [], []
     drop_row = ["seen→unseen"]
+    regen_drop_row = ["regen seen→unseen"]
     for scheme in SCHEME_ORDER:
         seen_vals, unseen_vals = [], []
+        regen_seen_vals, regen_unseen_vals = [], []
         if not wide.empty and "bit_accuracy" in wide.columns:
             for seed, g in wide[wide["scheme"] == scheme].groupby("seed"):
                 g = g.copy()
@@ -1016,13 +1211,22 @@ def generate_g1(runs: Sequence[RunBundle], out_dir: Path, **_: Any) -> Dict[str,
                 if len(sv) and len(uv):
                     seen_vals.append(float(sv.mean()))
                     unseen_vals.append(float(uv.mean()))
+                rs = g[g["attack"].isin(regen_seen_ids)]["bit_accuracy"]
+                ru = g[g["attack"].isin(regen_unseen_ids)]["bit_accuracy"]
+                if len(rs) and len(ru):
+                    regen_seen_vals.append(float(rs.mean()))
+                    regen_unseen_vals.append(float(ru.mean()))
         diffs = [s - u for s, u in zip(seen_vals, unseen_vals)]
         m, h, n = mean_ci95(diffs)
         drop_means.append(0.0 if not np.isfinite(m) else m)
         drop_errs.append(0.0 if not (n and np.isfinite(h)) else h)
         drop_labels.append(_scheme_label(scheme))
         drop_row.append(_fmt_ci(m, h, n))
+        rdiffs = [s - u for s, u in zip(regen_seen_vals, regen_unseen_vals)]
+        rm, rh, rn = mean_ci95(rdiffs)
+        regen_drop_row.append(_fmt_ci(rm, rh, rn))
     table_rows.append(drop_row)
+    table_rows.append(regen_drop_row)
 
     colors = [SCHEME_STYLE[s]["color"] for s in SCHEME_ORDER]
     ax2.bar(np.arange(len(SCHEME_ORDER)), drop_means, yerr=drop_errs,
@@ -1036,11 +1240,15 @@ def generate_g1(runs: Sequence[RunBundle], out_dir: Path, **_: Any) -> Dict[str,
     fig.tight_layout()
     artifacts = _save_fig(fig, out_dir, "g1")
     artifacts.update(_write_table(out_dir, "g1", table_headers, table_rows, also_figure=False))
+    artifacts["regen_seen"] = regen_seen_ids
+    artifacts["regen_unseen"] = regen_unseen_ids
     datasets = sorted({r.dataset for r in runs if r.dataset})
     cap = (
         f"\\caption{{Результати на невідомих (відкладених) атаках. "
         f"Метрика: {UK['bit_accuracy']}. {UK['mean_ci']}, $n={n_seeds}$ {UK['seeds']}. "
         f"Набір даних: {', '.join(datasets) or UK['not_eval']}. "
+        f"Клас регенерації: відомі={{{', '.join(regen_seen_ids)}}}, "
+        f"невідомі={{{', '.join(regen_unseen_ids)}}}. "
         f"Права панель: спад точності seen$\\to$unseen (менший спад — краще узагальнення). "
         f"Бюджети та $k$ — за протоколом C3. "
         f"{'Увага: менше ніж 3 запусків (seed).' if n_seeds < MIN_SEEDS else ''}}}"
@@ -1049,9 +1257,13 @@ def generate_g1(runs: Sequence[RunBundle], out_dir: Path, **_: Any) -> Dict[str,
     return artifacts
 
 
-def _config_diff(a: Mapping[str, Any], b: Mapping[str, Any]) -> List[str]:
-    ignore = F2_IGNORE
-    ca, cb = canonical_config(a, ignore=ignore), canonical_config(b, ignore=ignore)
+def _config_diff(
+    a: Mapping[str, Any],
+    b: Mapping[str, Any],
+    ignore: Optional[Iterable[str]] = None,
+) -> List[str]:
+    skip = set(ignore) if ignore is not None else set(F2_IGNORE)
+    ca, cb = canonical_config(a, ignore=skip), canonical_config(b, ignore=skip)
 
     def _walk(x, y, prefix=""):
         diffs = []
@@ -1069,105 +1281,479 @@ def _config_diff(a: Mapping[str, Any], b: Mapping[str, Any]) -> List[str]:
     return _walk(ca, cb)
 
 
+def _config_fingerprint(cfg: Mapping[str, Any], ignore: Iterable[str]) -> str:
+    return json.dumps(canonical_config(cfg, ignore=ignore), sort_keys=True, default=str)
+
+
+def _assert_config_identity(
+    run_groups: Sequence[Sequence[RunBundle]],
+    *,
+    ignore: Iterable[str],
+    fig_id: str,
+    allowed_msg: str,
+) -> None:
+    """Abort if any two runs differ outside ``ignore`` keys."""
+    refs: List[RunBundle] = []
+    for group in run_groups:
+        if group:
+            refs.append(group[0])
+        for r in group[1:]:
+            diffs = _config_diff(group[0].config, r.config, ignore=ignore)
+            if diffs:
+                raise SystemExit(
+                    f"{fig_id} abort: intra-group configs differ beyond {allowed_msg} "
+                    f"({r.path}):\n  " + "\n  ".join(diffs)
+                )
+    for i in range(len(refs)):
+        for j in range(i + 1, len(refs)):
+            diffs = _config_diff(refs[i].config, refs[j].config, ignore=ignore)
+            if diffs:
+                raise SystemExit(
+                    f"{fig_id} abort: configs differ beyond {allowed_msg}:\n  "
+                    + "\n  ".join(diffs)
+                )
+
+
+def _select_coherent_branch_runs(
+    by_branch: Dict[str, List[RunBundle]],
+    *,
+    ignore: Iterable[str],
+) -> Dict[str, List[RunBundle]]:
+    """Keep the largest config-fingerprint cluster so mixed sweeps do not break F2."""
+    from collections import Counter
+
+    all_runs = [r for rs in by_branch.values() for r in rs]
+    if not all_runs:
+        return by_branch
+    counts = Counter(_config_fingerprint(r.config, ignore) for r in all_runs)
+    best_fp = counts.most_common(1)[0][0]
+    return {
+        b: [r for r in rs if _config_fingerprint(r.config, ignore) == best_fp]
+        for b, rs in by_branch.items()
+    }
+
+
+def _f2_seed_means(
+    wide: pd.DataFrame,
+    branches: Sequence[str],
+    *,
+    seen: Optional[bool] = None,
+    regen_unseen_only: bool = False,
+) -> Dict[str, Dict[Any, float]]:
+    """Per-branch map seed → mean bit_accuracy under the given filter."""
+    out: Dict[str, Dict[Any, float]] = {b: {} for b in branches}
+    if wide.empty or "bit_accuracy" not in wide.columns:
+        return out
+    panel = wide[wide["attack"].astype(str) != "clean"].copy()
+    if panel.empty:
+        return out
+    if "seen_flag" in panel.columns:
+        flag = panel["seen_flag"].astype(str).str.lower().isin(["true", "1", "yes"])
+    else:
+        flag = pd.Series([False] * len(panel), index=panel.index)
+    if regen_unseen_only:
+        regen_ids = {s.id for s in ATTACK_REGISTRY if s.cls == "regen" and not s.seen_in_training}
+        panel = panel[(~flag) & panel["attack"].astype(str).isin(regen_ids)]
+    elif seen is True:
+        panel = panel[flag]
+    elif seen is False:
+        panel = panel[~flag]
+    for branch in branches:
+        sub = panel[panel["regen_branch"].astype(str) == branch]
+        for seed, g in sub.groupby("seed"):
+            out[branch][seed] = float(g["bit_accuracy"].mean())
+    return out
+
+
+def _paired_diff_ci(
+    a: Mapping[Any, float], b: Mapping[Any, float]
+) -> Tuple[float, float, int]:
+    common = sorted(set(a) & set(b), key=lambda s: str(s))
+    diffs = [float(a[s]) - float(b[s]) for s in common]
+    return mean_ci95(diffs)
+
+
 def generate_f2(runs: Sequence[RunBundle], out_dir: Path, **_: Any) -> Dict[str, Any]:
-    """DDIM proxy vs blur surrogate ablation."""
+    """Ablation over regen_branch ∈ {ddim_proxy, blur_surrogate, none}."""
     configure_style()
-    # Config identity is asserted on *training* runs (cost.json). Eval runs are measurements.
     train_runs = [r for r in runs if r.cost]
-    by_branch: Dict[str, List[RunBundle]] = {"ddim_proxy": [], "blur_surrogate": []}
-    for r in (train_runs or list(runs)):
+    pool = train_runs or list(runs)
+    by_branch: Dict[str, List[RunBundle]] = {b: [] for b in F2_BRANCHES}
+    for r in pool:
         b = str(r.meta.get("regen_branch", r.config.get("regen_branch", "")))
         if b in by_branch:
             by_branch[b].append(r)
 
-    if by_branch["ddim_proxy"] and by_branch["blur_surrogate"]:
-        diffs = _config_diff(by_branch["ddim_proxy"][0].config, by_branch["blur_surrogate"][0].config)
-        if diffs:
+    # Prefer a coherent config cluster (so proxy-step sweeps do not pollute F2),
+    # but if that leaves <2 branches, assert on the full set to surface real mismatches.
+    filtered = _select_coherent_branch_runs(by_branch, ignore=F2_IGNORE)
+    present = [b for b in F2_BRANCHES if filtered[b]]
+    if len(present) >= 2:
+        by_branch = filtered
+    else:
+        present = [b for b in F2_BRANCHES if by_branch[b]]
+        if len(present) < 2:
             raise SystemExit(
-                "F2 abort: configs differ beyond --regen-branch / seed / run_name:\n  "
-                + "\n  ".join(diffs)
+                "F2 abort: need runs for at least two of "
+                f"{list(F2_BRANCHES)}; found {present or 'none'}."
             )
-        for group in by_branch.values():
-            ref = canonical_config(group[0].config, ignore=F2_IGNORE)
-            for r in group[1:]:
-                other = canonical_config(r.config, ignore=F2_IGNORE)
-                if other != ref:
-                    raise SystemExit(f"F2 abort: intra-branch config mismatch in {r.path}")
+    _assert_config_identity(
+        [by_branch[b] for b in present],
+        ignore=F2_IGNORE,
+        fig_id="F2",
+        allowed_msg="regen_branch / seed / run_name",
+    )
 
     df = _eval_frame(runs)
     wide = _wide_quality(df)
-    n_seeds = max(_n_seeds(df[df["regen_branch"] == b]) if not df.empty else 0
-                  for b in ("ddim_proxy", "blur_surrogate"))
-    fig, axes = plt.subplots(1, 2, figsize=(7.2, 3.3), sharey=True)
-    _warn_seeds(n_seeds, "f2", fig=fig)
-    headers = ["Група", BRANCH_STYLE["ddim_proxy"]["label"],
-               BRANCH_STYLE["blur_surrogate"]["label"], "Δ (DDIM − blur)"]
-    rows: List[List[str]] = []
+    n_seeds = max(
+        (_n_seeds(df[df["regen_branch"] == b]) if not df.empty else 0) for b in present
+    )
+    groups = (
+        ("seen", UK["seen"], True, False),
+        ("unseen", UK["unseen"], False, False),
+        ("unseen_regen", "Невідомі регенераційні", None, True),
+    )
+    group_vals: Dict[str, Dict[str, Dict[Any, float]]] = {}
+    for gid, _title, seen_flag, regen_only in groups:
+        group_vals[gid] = _f2_seed_means(
+            wide, present, seen=seen_flag, regen_unseen_only=regen_only
+        )
 
-    for ax, seen_flag, title in (
-        (axes[0], True, UK["seen"]),
-        (axes[1], False, UK["unseen"]),
-    ):
-        vals_by_seed: Dict[str, Dict[Any, float]] = {"ddim_proxy": {}, "blur_surrogate": {}}
-        if not wide.empty and "bit_accuracy" in wide.columns:
-            flag_series = wide["seen_flag"].astype(str).str.lower().isin(["true", "1", "yes"])
-            panel = wide[(flag_series if seen_flag else ~flag_series) & (wide["attack"] != "clean")]
-            for branch in vals_by_seed:
-                sub = panel[panel["regen_branch"] == branch]
-                for seed, g in sub.groupby("seed"):
-                    vals_by_seed[branch][seed] = float(g["bit_accuracy"].mean())
-        vals_map = {b: list(vals_by_seed[b].values()) for b in vals_by_seed}
-        xs = np.arange(2)
+    # Figure: grouped bars (groups × variants) with CI error bars.
+    fig, ax = plt.subplots(figsize=(7.2, 3.6))
+    _warn_seeds(n_seeds, "f2", fig=fig)
+    x = np.arange(len(groups))
+    width = 0.8 / max(len(present), 1)
+    for j, branch in enumerate(present):
         means, errs = [], []
-        for i, branch in enumerate(("ddim_proxy", "blur_surrogate")):
-            m, h, n = mean_ci95(vals_map[branch])
+        for gid, *_ in groups:
+            m, h, n = mean_ci95(list(group_vals[gid][branch].values()))
             means.append(m if n else np.nan)
             errs.append(h if n and np.isfinite(h) else 0.0)
-            st = BRANCH_STYLE[branch]
-            ax.bar(
-                i,
-                0.0 if not np.isfinite(means[-1]) else means[-1],
-                yerr=errs[-1],
-                color=st["color"],
-                error_kw={"elinewidth": 0.8, "capsize": 3},
-            )
-        ax.set_xticks(xs)
-        ax.set_xticklabels([BRANCH_STYLE[b]["label"] for b in ("ddim_proxy", "blur_surrogate")],
-                           rotation=15, ha="right")
-        ax.set_title(title)
-        ax.set_ylim(0, 1.05)
-        ax.grid(True, axis="y", alpha=0.3)
-        if seen_flag:
-            ax.set_ylabel(UK["bit_accuracy"])
-
-        ddim_s, blur_s = vals_by_seed["ddim_proxy"], vals_by_seed["blur_surrogate"]
-        common = sorted(set(ddim_s) & set(blur_s), key=lambda s: str(s))
-        diffs = [ddim_s[s] - blur_s[s] for s in common]
-        md, hd, nd = mean_ci95(diffs)
-        m0, h0, n0 = mean_ci95(list(ddim_s.values()))
-        m1, h1, n1 = mean_ci95(list(blur_s.values()))
-        rows.append([
-            title,
-            _fmt_ci(m0, h0, n0),
-            _fmt_ci(m1, h1, n1),
-            _fmt_ci(md, hd, nd),
-        ])
-
+        offset = (j - (len(present) - 1) / 2) * width
+        st = BRANCH_STYLE[branch]
+        ax.bar(
+            x + offset,
+            [0.0 if not np.isfinite(m) else m for m in means],
+            width,
+            yerr=errs,
+            color=st["color"],
+            label=st["label"],
+            error_kw={"elinewidth": 0.8, "capsize": 2},
+        )
+    ax.set_xticks(x)
+    ax.set_xticklabels([t for _, t, _, _ in groups], rotation=12, ha="right")
+    ax.set_ylabel(UK["decoding_accuracy"])
+    ax.set_ylim(0, 1.05)
+    ax.grid(True, axis="y", alpha=0.3)
+    ax.legend(fontsize=6, loc="lower right")
     fig.tight_layout()
+
+    # Table: three variant columns + two paired-difference columns.
+    headers = (
+        ["Група"]
+        + [BRANCH_STYLE[b]["label"] for b in F2_BRANCHES]
+        + ["Δ (DDIM − сурогат)", "Δ (DDIM − без гілки)"]
+    )
+    rows: List[List[str]] = []
+    for gid, title, _, _ in groups:
+        row = [title]
+        for branch in F2_BRANCHES:
+            if branch in present:
+                m, h, n = mean_ci95(list(group_vals[gid][branch].values()))
+                row.append(_fmt_ci(m, h, n))
+            else:
+                row.append(UK["not_eval"])
+        ddim = group_vals[gid].get("ddim_proxy", {})
+        blur = group_vals[gid].get("blur_surrogate", {})
+        none = group_vals[gid].get("none", {})
+        if "ddim_proxy" in present and "blur_surrogate" in present:
+            md, hd, nd = _paired_diff_ci(ddim, blur)
+            row.append(_fmt_ci(md, hd, nd))
+        else:
+            row.append(UK["not_eval"])
+        if "ddim_proxy" in present and "none" in present:
+            md, hd, nd = _paired_diff_ci(ddim, none)
+            row.append(_fmt_ci(md, hd, nd))
+        else:
+            row.append(UK["not_eval"])
+        rows.append(row)
+
     artifacts = _save_fig(fig, out_dir, "f2")
     artifacts.update(_write_table(out_dir, "f2", headers, rows, also_figure=False))
+    artifacts["branches"] = list(present)
     datasets = sorted({r.dataset for r in runs if r.dataset})
+    branch_labels = ", ".join(BRANCH_STYLE[b]["label"] for b in present)
     cap = (
-        f"\\caption{{Абляція навчальної гілки регенерації: DDIM-проксі проти розмиття-сурогату "
-        f"(режим VINE). Метрика: {UK['bit_accuracy']}. {UK['mean_ci']}, "
+        f"\\caption{{Абляція навчальної гілки регенерації ({branch_labels}). "
+        f"Рядки: відомі трансформації, невідомі трансформації та невідомі регенераційні. "
+        f"Метрика: {UK['decoding_accuracy']}. {UK['mean_ci']}, "
         f"$n={n_seeds}$ {UK['seeds']}. Набір даних: {', '.join(datasets) or UK['not_eval']}. "
-        f"$\\Delta$ — різниця DDIM − blur. Конфігурації ідентичні з точністю до "
-        f"\\texttt{{--regen-branch}}. "
+        f"$\\Delta$ — попарні різниці за seed (DDIM $-$ сурогат / DDIM $-$ без гілки). "
+        f"Конфігурації ідентичні з точністю до \\texttt{{regen\\_branch}}, seed і run\\_name. "
         f"{'Увага: менше ніж 3 запусків (seed).' if n_seeds < MIN_SEEDS else ''}}}"
     )
     artifacts["caption"] = str(_write_caption(out_dir, "f2", cap))
-    if not by_branch["ddim_proxy"] or not by_branch["blur_surrogate"]:
-        print("WARNING [f2]: need runs for both ddim_proxy and blur_surrogate.")
+    return artifacts
+
+
+def _n_steps_of(run: RunBundle) -> int:
+    regen = run.config.get("regen") or {}
+    if isinstance(regen, Mapping) and "n_steps" in regen:
+        return int(regen["n_steps"])
+    return int(run.config.get("n_steps", run.meta.get("n_steps", 4) or 4))
+
+
+def _epochs_of(run: RunBundle) -> int:
+    return int(run.config.get("epochs", run.meta.get("epochs", 0) or 0))
+
+
+def _cost_seconds_per_epoch(run: RunBundle) -> Optional[float]:
+    if not run.cost:
+        return None
+    if "seconds_per_epoch_mean" in run.cost:
+        try:
+            return float(run.cost["seconds_per_epoch_mean"])
+        except (TypeError, ValueError):
+            pass
+    v = run.cost.get("seconds_per_epoch")
+    if isinstance(v, list) and v:
+        return float(np.mean(v))
+    try:
+        return float(v) if v is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _cost_peak_gpu_gb(run: RunBundle) -> Optional[float]:
+    if not run.cost:
+        return None
+    if "peak_gpu_memory_gb_max" in run.cost:
+        try:
+            return float(run.cost["peak_gpu_memory_gb_max"])
+        except (TypeError, ValueError):
+            pass
+    v = run.cost.get("peak_gpu_memory_bytes")
+    if isinstance(v, list) and v:
+        return float(max(v) / (1024**3))
+    try:
+        return float(v) / (1024**3) if v is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def generate_f3(runs: Sequence[RunBundle], out_dir: Path, **_: Any) -> Dict[str, Any]:
+    """Proxy-steps sweep: unseen-regen accuracy and training cost vs ``regen.n_steps``."""
+    configure_style()
+    train_runs = [r for r in runs if r.cost] or list(runs)
+    # Prefer the largest F3-coherent cluster that still spans ≥2 distinct S values
+    # (so main ablation runs with a single S do not block the sweep).
+    from collections import defaultdict
+
+    fp_groups: Dict[str, List[RunBundle]] = defaultdict(list)
+    for r in train_runs:
+        fp_groups[_config_fingerprint(r.config, F3_IGNORE)].append(r)
+
+    def _score(rs: List[RunBundle]) -> Tuple[int, int]:
+        return (len({_n_steps_of(r) for r in rs}), len(rs))
+
+    if not fp_groups:
+        raise SystemExit("F3 abort: no runs available.")
+    chosen = max(fp_groups.values(), key=_score)
+    by_s: Dict[int, List[RunBundle]] = {}
+    for r in chosen:
+        by_s.setdefault(_n_steps_of(r), []).append(r)
+    if len(by_s) < 2:
+        raise SystemExit(
+            "F3 abort: need training runs for at least two distinct regen.n_steps values "
+            f"(with configs identical aside from n_steps / epochs / seed / run_name); "
+            f"found {sorted(by_s) or 'none'}."
+        )
+    _assert_config_identity(
+        [by_s[s] for s in sorted(by_s)],
+        ignore=F3_IGNORE,
+        fig_id="F3",
+        allowed_msg="n_steps / epochs / seed / run_name",
+    )
+
+    steps = sorted(by_s)
+    epochs_used = sorted({_epochs_of(r) for rs in by_s.values() for r in rs if _epochs_of(r) > 0})
+    epochs_str = (
+        str(epochs_used[0])
+        if len(epochs_used) == 1
+        else (", ".join(str(e) for e in epochs_used) if epochs_used else UK["not_eval"])
+    )
+
+    df = _eval_frame(runs)
+    wide = _wide_quality(df)
+    # Attach n_steps from matching training identity (scheme, seed) when missing.
+    if not wide.empty and "n_steps" not in wide.columns:
+        wide = wide.copy()
+        wide["n_steps"] = np.nan
+        for r in runs:
+            s = _n_steps_of(r)
+            mask = (wide["seed"].astype(str) == str(r.seed)) & (
+                wide["scheme"].astype(str) == str(r.scheme)
+            )
+            if "regen_branch" in wide.columns:
+                rb = str(r.meta.get("regen_branch", r.config.get("regen_branch", "")))
+                mask = mask & (wide["regen_branch"].astype(str) == rb)
+            wide.loc[mask, "n_steps"] = s
+
+    regen_unseen_ids = {
+        s.id for s in ATTACK_REGISTRY if s.cls == "regen" and not s.seen_in_training
+    }
+    acc_by_s: Dict[int, List[float]] = {s: [] for s in steps}
+    if not wide.empty and "bit_accuracy" in wide.columns:
+        flag = wide["seen_flag"].astype(str).str.lower().isin(["true", "1", "yes"])
+        panel = wide[(~flag) & wide["attack"].astype(str).isin(regen_unseen_ids)]
+        for s in steps:
+            sub = panel[panel["n_steps"] == s] if "n_steps" in panel.columns else panel.iloc[0:0]
+            if sub.empty:
+                # Fall back: evaluate rows from runs with this S.
+                run_keys = {(str(r.scheme), str(r.seed)) for r in by_s[s]}
+                sub = panel[
+                    panel.apply(
+                        lambda row: (str(row["scheme"]), str(row["seed"])) in run_keys,
+                        axis=1,
+                    )
+                ] if not panel.empty else panel
+            for seed, g in sub.groupby("seed"):
+                acc_by_s[s].append(float(g["bit_accuracy"].mean()))
+
+    sec_by_s: Dict[int, List[float]] = {s: [] for s in steps}
+    mem_by_s: Dict[int, List[float]] = {s: [] for s in steps}
+    for s in steps:
+        for r in by_s[s]:
+            sec = _cost_seconds_per_epoch(r)
+            mem = _cost_peak_gpu_gb(r)
+            if sec is not None:
+                sec_by_s[s].append(sec)
+            if mem is not None:
+                mem_by_s[s].append(mem)
+
+    seeds_per_s = [len(set(str(r.seed) for r in by_s[s])) for s in steps]
+    single_seed = max(seeds_per_s) <= 1
+    n_seeds = max(seeds_per_s) if seeds_per_s else 0
+
+    fig, (ax0, ax1) = plt.subplots(1, 2, figsize=(7.2, 3.4))
+    _warn_seeds(n_seeds, "f3", fig=fig)
+    if single_seed:
+        fig.text(
+            0.01,
+            0.99,
+            "1 запуск на значення S",
+            transform=fig.transFigure,
+            color="crimson",
+            ha="left",
+            va="top",
+            fontsize=7,
+            fontweight="bold",
+        )
+
+    # (a) accuracy vs S
+    means, errs = [], []
+    for s in steps:
+        m, h, n = mean_ci95(acc_by_s[s])
+        means.append(m if n else np.nan)
+        errs.append(h if n and np.isfinite(h) else 0.0)
+    ax0.errorbar(
+        steps,
+        [0.0 if not np.isfinite(m) else m for m in means],
+        yerr=errs,
+        color="#0072B2",
+        marker="o",
+        capsize=3,
+        linewidth=1.2,
+    )
+    ax0.set_xlabel("Кількість кроків проксі $S$")
+    ax0.set_ylabel(UK["decoding_accuracy"])
+    ax0.set_xticks(steps)
+    ax0.set_ylim(0, 1.05)
+    ax0.grid(True, alpha=0.3)
+    ax0.set_title("Невідомі регенераційні")
+
+    # (b) cost vs S (twin y-axes)
+    sec_m, sec_e, mem_m, mem_e = [], [], [], []
+    for s in steps:
+        m, h, n = mean_ci95(sec_by_s[s])
+        sec_m.append(m if n else np.nan)
+        sec_e.append(h if n and np.isfinite(h) else 0.0)
+        m2, h2, n2 = mean_ci95(mem_by_s[s])
+        mem_m.append(m2 if n2 else np.nan)
+        mem_e.append(h2 if n2 and np.isfinite(h2) else 0.0)
+    ax1.errorbar(
+        steps,
+        [0.0 if not np.isfinite(m) else m for m in sec_m],
+        yerr=sec_e,
+        color="#0072B2",
+        marker="o",
+        capsize=3,
+        label=UK["time_epoch"],
+    )
+    ax1b = ax1.twinx()
+    ax1b.errorbar(
+        steps,
+        [0.0 if not np.isfinite(m) else m for m in mem_m],
+        yerr=mem_e,
+        color="#E69F00",
+        marker="s",
+        capsize=3,
+        label=UK["peak_gpu"],
+    )
+    ax1.set_xlabel("Кількість кроків проксі $S$")
+    ax1.set_ylabel(UK["time_epoch"], color="#0072B2")
+    ax1b.set_ylabel(UK["peak_gpu"], color="#E69F00")
+    ax1.set_xticks(steps)
+    ax1.grid(True, alpha=0.3)
+    lines1, lab1 = ax1.get_legend_handles_labels()
+    lines2, lab2 = ax1b.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, lab1 + lab2, fontsize=6, loc="upper left")
+    ax1.set_title("Вартість навчання")
+
+    fig.tight_layout()
+    artifacts = _save_fig(fig, out_dir, "f3")
+
+    headers = [
+        "$S$",
+        UK["decoding_accuracy"],
+        UK["time_epoch"],
+        UK["peak_gpu"],
+        UK["seeds"],
+    ]
+    rows: List[List[str]] = []
+    for s in steps:
+        ma, ha, na = mean_ci95(acc_by_s[s])
+        ms, hs, ns = mean_ci95(sec_by_s[s])
+        mm, hm, nm = mean_ci95(mem_by_s[s])
+        rows.append(
+            [
+                str(s),
+                _fmt_ci(ma, ha, na),
+                _fmt_ci(ms, hs, ns),
+                _fmt_ci(mm, hm, nm),
+                str(len(set(str(r.seed) for r in by_s[s]))),
+            ]
+        )
+    artifacts.update(_write_table(out_dir, "f3", headers, rows, also_figure=False))
+    artifacts["n_steps"] = list(steps)
+    artifacts["epochs"] = epochs_used
+    datasets = sorted({r.dataset for r in runs if r.dataset})
+    single_note = " 1 запуск на значення $S$." if single_seed else ""
+    cap = (
+        f"\\caption{{Залежність від кількості кроків проксі $S$ "
+        f"(\\texttt{{regen.n\\_steps}}). "
+        f"(а) {UK['decoding_accuracy']} на невідомих регенераційних трансформаціях; "
+        f"(б) {UK['time_epoch']} та {UK['peak_gpu']} (з \\texttt{{cost.json}}). "
+        f"Навчання sweep: {epochs_str} епох. "
+        f"{UK['mean_ci']}, $n={n_seeds}$ {UK['seeds']}. "
+        f"Набір даних: {', '.join(datasets) or UK['not_eval']}. "
+        f"Конфігурації ідентичні з точністю до $S$, epochs, seed і run\\_name."
+        f"{single_note} "
+        f"{'Увага: менше ніж 3 запусків (seed).' if n_seeds < MIN_SEEDS and not single_seed else ''}}}"
+    )
+    artifacts["caption"] = str(_write_caption(out_dir, "f3", cap))
     return artifacts
 
 
@@ -1611,6 +2197,7 @@ GENERATORS = {
     "c3": generate_c3,
     "g1": generate_g1,
     "f2": generate_f2,
+    "f3": generate_f3,
     "b1": generate_b1,
     "d1": generate_d1,
     "e1": generate_e1,
@@ -1625,6 +2212,7 @@ def generate_all(
     run_dirs: Sequence[Path | str],
     out_dir: Path | str,
     x_axis: str = "aggregate",
+    c3_scheme: str = "ours",
 ) -> Dict[str, Any]:
     configure_style()
     out_dir = Path(out_dir)
@@ -1636,15 +2224,23 @@ def generate_all(
         "source_runs": [str(Path(p).resolve()) for p in run_dirs],
         "figures": {},
         "n_runs": len(runs),
+        "c3_scheme": c3_scheme,
     }
     for fid in ids:
         if fid not in GENERATORS:
             raise SystemExit(f"Unknown figure id: {fid}. Choose from {', '.join(FIGURE_IDS)}, all")
         print(f"[viz] generating {fid} ...")
         try:
-            art = GENERATORS[fid](runs, out_dir, x_axis=x_axis)
-        except SystemExit:
-            raise
+            art = GENERATORS[fid](
+                runs, out_dir, x_axis=x_axis, c3_scheme=c3_scheme
+            )
+        except SystemExit as e:
+            # Keep ``--figure all`` robust: record the abort and continue.
+            if figure == "all":
+                print(f"[viz] FAILED {fid}: {e}")
+                art = {"error": str(e)}
+            else:
+                raise
         except Exception as e:
             print(f"[viz] FAILED {fid}: {e}")
             art = {"error": str(e)}
@@ -1672,7 +2268,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--figure",
         type=str,
         required=True,
-        help="Figure id (d4,c3,g1,f2,b1,d1,e1,c1,c2,h1) or 'all'",
+        help="Figure id (d4,c3,g1,f2,f3,b1,d1,e1,c1,c2,h1) or 'all'",
     )
     p.add_argument("--runs", nargs="+", required=True, help="Run directories")
     p.add_argument("--out", type=str, required=True, help="Output directory")
@@ -1683,12 +2279,25 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         choices=["aggregate", "psnr", "lpips"],
         help="D4 x-axis: aggregate quality degradation, raw PSNR, or raw LPIPS",
     )
+    p.add_argument(
+        "--c3-scheme",
+        type=str,
+        default="ours",
+        help="Scheme id whose measured pert_l2 / pert_linf / pert_lpips fill C3 "
+        "(default: ours)",
+    )
     return p.parse_args(argv)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
     args = parse_args(argv)
-    generate_all(args.figure, args.runs, args.out, x_axis=args.x_axis)
+    generate_all(
+        args.figure,
+        args.runs,
+        args.out,
+        x_axis=args.x_axis,
+        c3_scheme=args.c3_scheme,
+    )
 
 
 if __name__ == "__main__":

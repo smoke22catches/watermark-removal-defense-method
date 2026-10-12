@@ -97,6 +97,8 @@ def _train_once(run_dir: Path, cfg: Dict[str, Any]):
         num_samples=cfg.get("num_samples"),
         val_fraction=float(cfg["val_fraction"]),
         seed=int(cfg["seed"]),
+        splits_dir=str(cfg.get("splits_dir", "data/splits")),
+        split_seed=int(cfg.get("split_seed", 20241010)),
     )
     logger = RunLogger(run_dir, cfg, append_metrics=True)
     enc, dec = _make_models(cfg)

@@ -24,7 +24,13 @@ from src.attacks.registry import (
     get_attack,
 )
 from src.attacks.regeneration import build_regen_proxy, make_text_embeds
-from src.data.datasets import build_dataloaders
+from src.baselines.factory import as_encoder_decoder, load_baseline
+from src.data.datasets import build_test_loader
+from src.data.splits import (
+    DEFAULT_SPLIT_SEED,
+    DEFAULT_SPLITS_DIR,
+    verify_infer_no_train_overlap,
+)
 from src.engine.evaluate import apply_attack, evaluate_protocol, evaluate_single_image
 from src.engine.train import _build_regen_branch
 from src.models import Decoder, Encoder
@@ -36,6 +42,7 @@ from src.utils.metrics import (
     config_hash,
     dump_json,
     git_commit_hash,
+    load_json,
     long_row,
     utc_now_iso,
 )
@@ -97,6 +104,14 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def _checkpoint_run_dir(ckpt_path: str | Path) -> Optional[Path]:
+    """``.../checkpoints/best.pt`` → run directory containing ``run_meta.json``."""
+    p = Path(ckpt_path).resolve()
+    if p.parent.name == "checkpoints":
+        return p.parent.parent
+    return p.parent if (p.parent / "run_meta.json").is_file() else None
+
+
 def _load_models(ckpt_path: str, cfg: dict, device: str):
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     msg_len = int(cfg.get("msg_len", ckpt.get("config", {}).get("msg_len", 64)))
@@ -118,7 +133,7 @@ def _load_models(ckpt_path: str, cfg: dict, device: str):
             merged = dict(ckpt_cfg["regen"])
             merged.update(cfg.get("regen") or {})
             cfg["regen"] = merged
-    return encoder.to(device), decoder.to(device), msg_len
+    return encoder.to(device), decoder.to(device), msg_len, ckpt
 
 
 def _not_evaluated_rows(
@@ -158,10 +173,24 @@ def _write_meta(run_dir: Path, cfg: dict, args: argparse.Namespace, extra: Dict[
         "checkpoint": args.checkpoint,
         "seed": int(cfg.get("seed", 42)),
         "protocol_version": PROTOCOL_VERSION,
+        "msg_len": int(
+            extra.get("msg_len")
+            or (
+                cfg.get("msg_len", info.get("payload_bits") or 0)
+                if args.scheme == "ours"
+                else info.get("payload_bits") or cfg.get("msg_len") or 0
+            )
+        ),
         "payload_bits": (
             int(cfg.get("msg_len", info.get("payload_bits") or 0))
             if args.scheme == "ours"
             else int(info.get("payload_bits") or cfg.get("msg_len") or 0)
+        ),
+        "native_resolution": int(
+            extra.get("native_resolution")
+            or info.get("train_resolution")
+            or cfg.get("image_size")
+            or 0
         ),
         "train_resolution": (
             int(cfg.get("image_size", info.get("train_resolution") or 0))
@@ -169,6 +198,7 @@ def _write_meta(run_dir: Path, cfg: dict, args: argparse.Namespace, extra: Dict[
             else int(info.get("train_resolution") or cfg.get("image_size") or 0)
         ),
         "weights": info.get("weights"),
+        "weight_source": extra.get("weight_source"),
         "sweep_strengths": bool(args.sweep_strengths),
         "quality_only": bool(args.quality_only),
         "config_hash": config_hash(cfg),
@@ -220,15 +250,52 @@ def main() -> None:
     logger.log(f"Run directory: {run_dir}")
 
     scheme = args.scheme
-    info = SCHEME_INFO[scheme]
-    available = bool(info.get("available", False)) and scheme == "ours"
-    if scheme != "ours":
-        available = False  # official weights are not bundled
+    info = dict(SCHEME_INFO[scheme])
+    cfg["scheme"] = scheme
+    baseline_handle = None
+    weight_meta: Dict[str, Any] = {}
+    train_list: List[str] = []
+
+    if scheme == "ours":
+        if not args.checkpoint:
+            raise SystemExit("--checkpoint is required for --scheme ours")
+        encoder, decoder, msg_len, _ckpt = _load_models(args.checkpoint, cfg, device)
+        train_run_dir = _checkpoint_run_dir(args.checkpoint)
+        train_meta: Dict[str, Any] = {}
+        if train_run_dir is not None and (train_run_dir / "run_meta.json").is_file():
+            train_meta = load_json(train_run_dir / "run_meta.json")
+        train_splits = train_meta.get("splits") or {}
+        train_list = list(train_splits.get("train_list") or [])
+        available = True
+        reason = "local checkpoint"
+        weight_meta = {
+            "scheme": "ours",
+            "source_url": "local",
+            "license": "project",
+            "version": "checkpoint",
+            "weight_files": {"checkpoint": str(args.checkpoint)},
+            "notes": "Proposed Encoder/Decoder",
+        }
+    else:
+        load_res = load_baseline(scheme, device=device, config=cfg)
+        available = bool(load_res.available)
+        reason = load_res.reason
+        if load_res.not_applicable:
+            reason = load_res.reason or str(info.get("reason", "not_applicable"))
+        if available and load_res.instance is not None:
+            baseline_handle = load_res.instance
+            encoder, decoder, msg_len = as_encoder_decoder(load_res)
+            weight_meta = load_res.instance.provenance().as_dict()
+            # Overlap check only applies when a training run_meta is provided.
+            train_list = []
+        else:
+            encoder = decoder = None  # type: ignore[assignment]
+            msg_len = int(info.get("payload_bits") or cfg.get("msg_len") or 0)
 
     if not available:
         logger.log(
-            f"Scheme '{scheme}' is not available in this checkout "
-            f"(weights={info.get('weights')}). Writing {NOT_EVALUATED} markers."
+            f"Scheme '{scheme}' is not available ({reason}). "
+            f"Writing {NOT_EVALUATED} markers. See docs/baselines.md."
         )
         rows = _not_evaluated_rows(seed, args.sweep_strengths, args.quality_only)
         logger.log_metric_rows(rows)
@@ -236,16 +303,19 @@ def main() -> None:
             run_dir,
             cfg,
             args,
-            {"status": NOT_EVALUATED, "reason": "weights_not_bundled"},
+            {
+                "status": NOT_EVALUATED,
+                "reason": reason,
+                "scheme": scheme,
+                "msg_len": int(info.get("payload_bits") or 0),
+                "native_resolution": info.get("train_resolution"),
+                "weight_source": weight_meta or {"scheme": scheme},
+            },
         )
         logger.close()
         print(f"Done. Results in {run_dir}")
         return
 
-    if not args.checkpoint:
-        raise SystemExit("--checkpoint is required for --scheme ours")
-
-    encoder, decoder, msg_len = _load_models(args.checkpoint, cfg, device)
     regen_cfg = cfg.get("regen", {})
     use_placeholder = bool(regen_cfg.get("use_placeholder", True))
     sd_model_id = str(regen_cfg.get("sd_model_id", "runwayml/stable-diffusion-v1-5"))
@@ -275,6 +345,18 @@ def main() -> None:
         regen_out = cfg.setdefault("regen", {})
         regen_out["sd_model_id"] = str(regen_proxy.sd_model_id)
         regen_out["sd_revision"] = getattr(regen_proxy, "sd_revision", None)
+
+    native_res = (
+        int(getattr(baseline_handle, "native_resolution", 0) or 0)
+        if baseline_handle is not None
+        else int(cfg.get("image_size", info.get("train_resolution") or 0) or 0)
+    )
+    if baseline_handle is not None:
+        native_res = int(baseline_handle.native_resolution)
+        msg_len = int(baseline_handle.msg_len)
+    logger.log(
+        f"Scheme={scheme} available msg_len={msg_len} native_resolution={native_res}"
+    )
 
     try:
         if args.image:
@@ -359,20 +441,43 @@ def main() -> None:
                 attacks = ["clean"]
             else:
                 attacks = [s.id for s in ATTACK_REGISTRY]
-            _, val_loader = build_dataloaders(
+            test_loader, split_info = build_test_loader(
                 dataset_name=str(cfg.get("dataset", "synthetic")),
                 data_root=str(cfg.get("data_root", "./data")),
                 image_size=int(cfg.get("image_size", 128)),
                 batch_size=int(cfg.get("batch_size", 4)),
                 num_workers=int(cfg.get("num_workers", 0)),
+                splits_dir=str(cfg.get("splits_dir", DEFAULT_SPLITS_DIR)),
+                split_seed=int(cfg.get("split_seed", DEFAULT_SPLIT_SEED)),
                 num_samples=cfg.get("num_samples"),
-                val_fraction=float(cfg.get("val_fraction", 0.1)),
-                seed=seed,
+            )
+            test_list = list(split_info.get("test_list") or [])
+            if train_list:
+                try:
+                    verify_infer_no_train_overlap(
+                        test_list,
+                        train_list,
+                        data_root=str(cfg.get("data_root", "./data")),
+                    )
+                except RuntimeError as e:
+                    raise SystemExit(
+                        f"Inference aborted: test set overlaps training set from "
+                        f"checkpoint run metadata.\n{e}"
+                    ) from e
+            else:
+                logger.log(
+                    "[warn] no train_list in checkpoint run_meta; "
+                    "skipping train/test overlap safety check"
+                )
+            logger.log(
+                f"Test batches: {len(test_loader)}  "
+                f"split_hashes={split_info.get('split_hashes')}  "
+                f"(seed={seed} does not change test membership)"
             )
             rows = evaluate_protocol(
                 encoder,
                 decoder,
-                val_loader,
+                test_loader,
                 device=device,
                 attacks=attacks,
                 msg_len=msg_len,
@@ -398,7 +503,7 @@ def main() -> None:
             if means:
                 plot_eval_bit_accuracy(means, run_dir / "plots" / "bit_accuracy_bars.png")
 
-            batch = next(iter(val_loader))
+            batch = next(iter(test_loader))
             x = batch[0][:1].to(device)
             m = torch.randint(0, 2, (1, msg_len), device=device).float()
             with torch.no_grad():
@@ -439,11 +544,29 @@ def main() -> None:
                 {
                     "mode": "sweep",
                     "status": "done",
+                    "scheme": scheme,
+                    "msg_len": int(msg_len),
+                    "native_resolution": int(native_res),
+                    "weight_source": weight_meta,
                     "attacks": attacks,
                     "n_rows": len(rows),
+                    "splits": {
+                        "splits_dir": split_info.get("splits_dir"),
+                        "split_seed": split_info.get("split_seed"),
+                        "split_files": split_info.get("split_files"),
+                        "split_hashes": split_info.get("split_hashes"),
+                        "counts": split_info.get("counts"),
+                        "test_list": test_list,
+                        "train_list_from_checkpoint": train_list,
+                    },
                 },
             )
     finally:
+        if baseline_handle is not None:
+            try:
+                baseline_handle.close()
+            except Exception:
+                pass
         logger.close()
 
     print(f"Done. Results in {run_dir}")

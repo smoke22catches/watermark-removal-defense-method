@@ -27,15 +27,36 @@ You should see `cuda available: True` and your GPU name on the training server.
 
 ```bash
 # All supported sets (COCO, DIV2K, Imagenette, CLIC; ImageNet prints manual instructions)
+# Downloads train + eval folders so fixed splits never share one directory.
 python scripts/download_data.py --dataset all --data-root ./data
 
 # Single dataset, capped for a quick smoke test
-python scripts/download_data.py --dataset coco --split val2017 --num-samples 100
+python scripts/download_data.py --dataset coco --num-samples 100
 python scripts/download_data.py --dataset imagenette --num-samples 200
 ```
 
 Writes `data/manifest.json` with paths and image counts. Training falls back to a
 synthetic dataset if the named set is missing.
+
+## Fixed train / val / test splits
+
+Splits are **file lists** under `data/splits/<dataset>/`, generated once with a
+dedicated `split_seed` (independent of the training seed):
+
+```bash
+python scripts/make_splits.py --dataset all --data-root ./data --split-seed 20241010
+python scripts/make_splits.py --verify   # re-hash committed lists
+```
+
+- COCO: train from `train2017`; val/test are disjoint fixed subsets of `val2017`
+  (test = 5,000 images).
+- DIV2K: train from `DIV2K_train_HR`, test from `DIV2K_valid_HR`.
+- Imagenette: train from `train/`, test from `val/`.
+
+Training reads only train (+ val for model selection). Inference reads only test
+and aborts if the test list overlaps the training list stored in the checkpoint's
+`run_meta.json`. Split filenames and SHA-256 hashes are recorded in `run_meta.json`
+(train) and `results_meta.json` (infer).
 
 ## Train
 
@@ -58,8 +79,12 @@ Common overrides: `--lr`, `--msg-len`, `--lambda-perc`, `--regen-steps`, `--resu
 ```bash
 # Attack sweep (includes UNSEEN blur held out from training)
 python scripts/infer.py --checkpoint runs/<run>/checkpoints/best.pt \
-  --dataset coco --device cuda --attacks clean,jpeg,regen,guided_regen,unseen_blur \
+  --dataset coco --device cuda --attacks clean,jpeg,regen_proxy,guided_regen,unseen_blur \
   --run-name eval_coco
+
+# Comparative baselines (TrustMark / StegaStamp / VINE) — see docs/baselines.md
+python scripts/infer.py --scheme trustmark --dataset coco --device cuda \
+  --image-size 256 --sweep-strengths --run-name eval_trustmark
 
 # Single image
 python scripts/infer.py --checkpoint runs/<run>/checkpoints/best.pt \

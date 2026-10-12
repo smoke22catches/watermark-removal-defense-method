@@ -9,12 +9,13 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from src.attacks.regeneration import TextConditioner, make_text_embeds
+from src.baselines.common import sample_bits
 from src.eval.metrics import perturbation_lpips, perturbation_norms
 from src.eval.registry import (
     ATTACK_REGISTRY,
     apply_spec,
-    default_strength,
     get_attack,
+    resolve_strengths,
 )
 from src.utils.metrics import (
     FIDMeter,
@@ -60,7 +61,7 @@ def apply_attack(
 
 
 def _needs_grad(attack_id: str) -> bool:
-    return attack_id in ("adv",)
+    return attack_id in ("adv", "guided_regen")
 
 
 def evaluate_protocol(
@@ -96,6 +97,9 @@ def evaluate_protocol(
     rows: List[Dict[str, Any]] = []
     k = int(msg_len)
     det_ok = detection_applicable(k)
+    # Identical seeded bit sampling for every scheme (reproducible across baselines).
+    msg_gen = torch.Generator(device="cpu")
+    msg_gen.manual_seed(int(seed) + 17_389)
 
     # Clean, never-watermarked detection statistics (shared across attacks).
     clean_stats: List[float] = []
@@ -103,7 +107,7 @@ def evaluate_protocol(
         with torch.no_grad():
             for batch in val_loader:
                 x = batch[0].to(device)
-                m_ref = torch.randint(0, 2, (x.size(0), k), device=device).float()
+                m_ref = sample_bits(x.size(0), k, device=device, generator=msg_gen)
                 logits_clean = decoder(x)
                 clean_stats.extend(matched_bit_counts(logits_clean, m_ref).cpu().tolist())
         if len(clean_stats) < 5000:
@@ -127,10 +131,11 @@ def evaluate_protocol(
             continue
 
         strengths: Sequence[float]
+        grid = resolve_strengths(spec, config)
         if sweep_strengths:
-            strengths = spec.strengths
+            strengths = grid
         else:
-            strengths = (default_strength(spec),)
+            strengths = (float(grid[len(grid) // 2]),)
 
         for strength in strengths:
             fid = FIDMeter(device=device) if compute_fid and compute_quality else None
@@ -143,9 +148,12 @@ def evaluate_protocol(
             pert_linf: List[float] = []
             pert_lpips: List[float] = []
 
+            # Reset message RNG per (attack, strength) so every transform sees
+            # the same cover→message pairing (fair across schemes).
+            msg_gen.manual_seed(int(seed) + 17_389)
             for batch in val_loader:
                 x = batch[0].to(device)
-                m = torch.randint(0, 2, (x.size(0), k), device=device).float()
+                m = sample_bits(x.size(0), k, device=device, generator=msg_gen)
                 with torch.no_grad():
                     x_w = encoder(x, m)
                 text_embeds = make_text_embeds(

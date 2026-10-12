@@ -8,6 +8,8 @@ from src.eval.registry import (
     get_attack,
     list_attack_ids,
     protocol_table_rows,
+    regeneration_seen_unseen,
+    resolve_strengths,
 )
 from src.eval.quantize import quantize_uint8
 
@@ -19,5 +21,7 @@ __all__ = [
     "get_attack",
     "list_attack_ids",
     "protocol_table_rows",
+    "regeneration_seen_unseen",
+    "resolve_strengths",
     "quantize_uint8",
 ]

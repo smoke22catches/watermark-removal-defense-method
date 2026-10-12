@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+"""Generate fixed train/val/test image lists under data/splits/.
+
+Uses a dedicated ``split_seed`` that is independent of the training seed.
+Re-running with the same arguments yields byte-identical list files.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from src.data.splits import (
+    DEFAULT_SPLIT_SEED,
+    DEFAULT_SPLITS_DIR,
+    COCO_TEST_SIZE,
+    COCO_VAL_SIZE,
+    generate_all_available,
+    generate_coco_splits,
+    generate_div2k_splits,
+    generate_imagenette_splits,
+    generate_synthetic_splits,
+    list_file_hash,
+    load_split_spec,
+)
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Generate fixed dataset splits")
+    p.add_argument(
+        "--dataset",
+        type=str,
+        default="all",
+        help="coco | div2k | imagenette | synthetic | all",
+    )
+    p.add_argument("--data-root", type=str, default="./data")
+    p.add_argument("--splits-dir", type=str, default=DEFAULT_SPLITS_DIR)
+    p.add_argument("--split-seed", type=int, default=DEFAULT_SPLIT_SEED)
+    p.add_argument("--coco-train-max", type=int, default=None)
+    p.add_argument("--coco-val-size", type=int, default=COCO_VAL_SIZE)
+    p.add_argument("--coco-test-size", type=int, default=COCO_TEST_SIZE)
+    p.add_argument("--synthetic-n", type=int, default=64)
+    p.add_argument(
+        "--verify",
+        action="store_true",
+        help="Re-hash existing split files and print hashes (no rewrite)",
+    )
+    return p.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    data_root = Path(args.data_root)
+    splits_dir = Path(args.splits_dir)
+    name = args.dataset.lower()
+
+    if args.verify:
+        names = (
+            ["coco", "div2k", "imagenette", "synthetic"]
+            if name == "all"
+            else [name]
+        )
+        for n in names:
+            try:
+                spec = load_split_spec(n, data_root=data_root, splits_dir=splits_dir)
+            except FileNotFoundError as e:
+                print(f"[verify] {n}: missing ({e})")
+                continue
+            print(f"[verify] {n}: seed={spec.split_seed} counts={spec.as_meta()['counts']}")
+            for fn, h in spec.file_hashes.items():
+                live = list_file_hash(spec.splits_dir / fn) if (spec.splits_dir / fn).exists() else ""
+                ok = "ok" if live == h else "MISMATCH"
+                print(f"  {fn}: {h[:16]}… [{ok}]")
+        return
+
+    if name == "all":
+        specs = generate_all_available(
+            data_root,
+            splits_dir,
+            split_seed=int(args.split_seed),
+            coco_train_max=args.coco_train_max,
+            coco_val_size=int(args.coco_val_size),
+            coco_test_size=int(args.coco_test_size),
+            synthetic_n=int(args.synthetic_n),
+        )
+    elif name == "coco":
+        specs = {
+            "coco": generate_coco_splits(
+                data_root,
+                splits_dir,
+                split_seed=int(args.split_seed),
+                train_max=args.coco_train_max,
+                val_size=int(args.coco_val_size),
+                test_size=int(args.coco_test_size),
+            )
+        }
+    elif name == "div2k":
+        specs = {
+            "div2k": generate_div2k_splits(
+                data_root, splits_dir, split_seed=int(args.split_seed)
+            )
+        }
+    elif name == "imagenette":
+        specs = {
+            "imagenette": generate_imagenette_splits(
+                data_root, splits_dir, split_seed=int(args.split_seed)
+            )
+        }
+    elif name == "synthetic":
+        specs = {
+            "synthetic": generate_synthetic_splits(
+                data_root,
+                splits_dir,
+                split_seed=int(args.split_seed),
+                num_samples=int(args.synthetic_n),
+            )
+        }
+    else:
+        raise SystemExit(f"Unknown dataset: {name}")
+
+    print("\nGenerated splits:")
+    for n, spec in specs.items():
+        meta = spec.as_meta()
+        print(
+            f"  {n}: train={meta['counts']['train']} val={meta['counts']['val']} "
+            f"test={meta['counts']['test']}  hashes={meta['split_hashes']}"
+        )
+
+
+if __name__ == "__main__":
+    main()

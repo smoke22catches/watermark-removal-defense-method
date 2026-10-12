@@ -11,8 +11,11 @@ dataset: coco  # coco | div2k | imagenette | clic | synthetic
 image_size: 64
 batch_size: 8
 num_workers: 2
-num_samples: null  # optional cap for quick tests
-val_fraction: 0.1
+num_samples: null  # optional cap for quick tests (train only)
+val_fraction: 0.1  # ignored when data/splits exist (kept for CLI compat)
+# Fixed splits (seed-independent). Generate with scripts/make_splits.py.
+splits_dir: data/splits
+split_seed: 20241010  # NEVER reuse the training seed
 
 # --- model ---
 # 16 bits is a reliable warm-start capacity; raise after clean bit-acc is high.
@@ -104,13 +107,25 @@ regen:
   beta_guided: 0.005
   J_guided: 5
 
+# --- baseline schemes (post-hoc comparative evaluation) ---
+baselines:
+  trustmark_variant: Q
+  trustmark_use_ecc: false   # raw 100-bit messages (shared sampler)
+  stegastamp_weights_dir: weights/stegastamp
+  vine_encoder_id: Shilin-LU/VINE-R-Enc
+  vine_decoder_id: Shilin-LU/VINE-R-Dec
+
 # --- evaluation (real transforms; never training DistortionBank approximations) ---
 eval:
-  attacks: [clean, jpeg, rotate, crop, noise, unseen_blur, diffpure, rinse_2, rinse_4, bmshj2018, cheng2020, adv]
+  attacks: [clean, jpeg, rotate, crop, noise, unseen_blur, regen_proxy, guided_regen, diffpure, rinse_2, rinse_4, bmshj2018, cheng2020, adv]
   # DiffPure / rinse use a DIFFERENT diffusion checkpoint than regen.sd_model_id.
   diffpure_model_id: CompVis/stable-diffusion-v1-4
   diffpure_steps: 50
   diffpure_t_start: 0.5
+  # Seen regen_proxy strengths: t* covering the training range around regen.t_start.
+  regen_proxy_t_starts: [0.2, 0.3, 0.4]
+  # Seen guided_regen strengths: eps_guided values around regen.eps_guided.
+  guided_eps_values: [0.01, 0.02, 0.04]
   unseen_blur_kernel: 5
   unseen_blur_sigma: 1.5
 

@@ -60,6 +60,8 @@ def main() -> None:
         num_samples=32,
         val_fraction=0.25,
         seed=123,
+        splits_dir=str(run_dir / "splits"),
+        split_seed=20241010,
     )
     logger = RunLogger(run_dir, cfg, append_metrics=True)
     enc = Encoder(msg_len=8, ch=16, strength=0.4)

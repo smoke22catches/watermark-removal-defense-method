@@ -15,6 +15,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.data.datasets import build_dataloaders
+from src.data.splits import DEFAULT_SPLIT_SEED, DEFAULT_SPLITS_DIR
 from src.engine.train import export_algorithm_tex, train
 from src.models import Decoder, Encoder
 from src.utils.checkpoint import COMPLETED_MARKER
@@ -128,8 +129,24 @@ def main() -> None:
         num_samples=cfg.get("num_samples"),
         val_fraction=float(cfg.get("val_fraction", 0.1)),
         seed=seed,
+        splits_dir=str(cfg.get("splits_dir", DEFAULT_SPLITS_DIR)),
+        split_seed=int(cfg.get("split_seed", DEFAULT_SPLIT_SEED)),
     )
-    logger.log(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
+    split_info = getattr(train_loader, "split_info", {}) or {}
+    meta["splits"] = {
+        "splits_dir": split_info.get("splits_dir"),
+        "split_seed": split_info.get("split_seed"),
+        "split_files": split_info.get("split_files"),
+        "split_hashes": split_info.get("split_hashes"),
+        "counts": split_info.get("counts"),
+        "train_list": split_info.get("train_list", []),
+        "test_list": split_info.get("test_list", []),
+    }
+    dump_json(run_dir / "run_meta.json", meta)
+    logger.log(
+        f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}  "
+        f"split_hashes={split_info.get('split_hashes')}"
+    )
 
     msg_len = int(cfg.get("msg_len", 16))
     encoder = Encoder(

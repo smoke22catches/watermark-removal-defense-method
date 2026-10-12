@@ -87,7 +87,7 @@ def test_protocol_table_lists_each_entry_once() -> None:
 def test_every_runnable_entry_batch_shape() -> None:
     torch.manual_seed(1)
     x = torch.rand(2, 3, 32, 32) * 2 - 1
-    # Minimal decoder for adv.
+    # Minimal decoder for adv / guided_regen.
     class TinyDec(torch.nn.Module):
         def __init__(self) -> None:
             super().__init__()
@@ -101,13 +101,27 @@ def test_every_runnable_entry_batch_shape() -> None:
         def forward(self, t: torch.Tensor) -> torch.Tensor:
             return self.net(t)
 
+    from src.attacks.regeneration import build_regen_proxy
+
     decoder = TinyDec()
     m = torch.randint(0, 2, (2, 16)).float()
     cfg = {
-        "regen": {"sd_model_id": DEFAULT_TRAIN_DIFFUSION_ID},
+        "regen": {
+            "use_placeholder": True,
+            "sd_model_id": DEFAULT_TRAIN_DIFFUSION_ID,
+            "sd_revision": None,
+            "J_guided": 2,
+            "eps_guided": 0.02,
+            "beta_guided": 0.005,
+        },
         "eval": {"diffpure_model_id": DEFAULT_EVAL_DIFFUSION_ID},
         "pgd": {"alpha": 0.005, "steps": 2},
     }
+    proxy = build_regen_proxy(
+        use_placeholder=True,
+        sd_model_id=DEFAULT_TRAIN_DIFFUSION_ID,
+        device="cpu",
+    )
     for spec in ATTACK_REGISTRY:
         if spec.not_evaluated:
             continue
@@ -117,6 +131,7 @@ def test_every_runnable_entry_batch_shape() -> None:
             strength=float(spec.strengths[0]),
             message=m,
             decoder=decoder,
+            regen_proxy=proxy,
             config=cfg,
         )
         assert y.shape == x.shape, f"{spec.id}: shape {y.shape} != {x.shape}"

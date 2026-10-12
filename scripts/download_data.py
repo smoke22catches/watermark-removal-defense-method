@@ -376,34 +376,70 @@ def main() -> None:
             print(f"[skip] unknown dataset '{name}'")
             continue
         print(f"\n=== {name} ===")
-        kwargs: Dict[str, Any] = {"data_root": data_root, "num_samples": args.num_samples}
+        # Default: download BOTH train and eval folders so fixed splits never
+        # resolve train and test to the same directory.
+        jobs: List[Dict[str, Any]] = []
         if args.split is not None:
-            kwargs["split"] = args.split
+            jobs.append({"split": args.split})
         elif name == "coco":
-            kwargs["split"] = "val2017"
+            jobs = [{"split": "train2017"}, {"split": "val2017"}]
         elif name == "div2k":
-            kwargs["split"] = "valid"
+            jobs = [{"split": "train"}, {"split": "valid"}]
+        elif name == "imagenette":
+            jobs = [{"split": "train"}, {"split": "val"}]
         elif name == "clic":
-            kwargs["split"] = "professional"
-        try:
-            entries.append(HANDLERS[name](**kwargs))
-        except Exception as e:
-            print(f"[{name}] error (continuing): {e}")
-            entries.append(
-                {
+            jobs = [{"split": "professional"}]
+        else:
+            jobs = [{}]
+
+        role_paths: Dict[str, str] = {}
+        last_entry: Dict[str, Any] = {
+            "name": name,
+            "path": str(data_root / name),
+            "num_images": 0,
+            "status": "error",
+        }
+        for job in jobs:
+            kwargs: Dict[str, Any] = {
+                "data_root": data_root,
+                "num_samples": args.num_samples,
+                **job,
+            }
+            try:
+                entry = HANDLERS[name](**kwargs)
+                last_entry = entry
+                split_name = str(entry.get("split") or job.get("split") or "")
+                if split_name:
+                    role_paths[split_name] = str(entry.get("path", ""))
+                print(f"  role={split_name or 'default'}: {entry.get('status')} n={entry.get('num_images')}")
+            except Exception as e:
+                print(f"[{name}] error (continuing): {e}")
+                last_entry = {
                     "name": name,
                     "path": str(data_root / name),
-                    "split": args.split,
+                    "split": job.get("split"),
                     "num_images": 0,
                     "status": "error",
                     "error": str(e),
                 }
-            )
+        # Prefer train path as the primary manifest path; keep all roles.
+        if "train2017" in role_paths:
+            last_entry["path"] = role_paths["train2017"]
+            last_entry["path_val"] = role_paths.get("val2017", "")
+        elif "train" in role_paths:
+            last_entry["path"] = role_paths["train"]
+            last_entry["path_val"] = role_paths.get("val") or role_paths.get("valid", "")
+        last_entry["paths"] = role_paths
+        entries.append(last_entry)
 
     write_manifest(data_root, entries)
     print("\nSummary:")
     for e in entries:
         print(f"  {e['name']}: {e.get('status')}  path={e.get('path')}  n={e.get('num_images')}")
+    print(
+        "\nNext: python scripts/make_splits.py --dataset all "
+        "(writes data/splits/*/{{train,val,test}}.txt)"
+    )
 
 
 if __name__ == "__main__":
