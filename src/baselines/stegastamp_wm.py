@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import tarfile
+import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -21,8 +22,12 @@ from src.baselines.common import (
 
 STEGA_SOURCE = "https://github.com/tancik/StegaStamp"
 STEGA_LICENSE = "MIT"
+# Authors' README historically pointed here; the Berkeley host now returns 404.
 STEGA_WEIGHTS_URL = "http://people.eecs.berkeley.edu/~tancik/stegastamp/saved_models.tar.xz"
-# Checksum filled after first successful download (also verified in docs/baselines.md).
+# Community mirror of the same TF SavedModel (not a PyTorch re-train).
+STEGA_HF_REPO = "KingTechnician/stegastamp"
+STEGA_HF_ALLOW = ["stegastamp_pretrained/**"]
+# Checksum filled after first successful archive download (also verified in docs/baselines.md).
 STEGA_ARCHIVE_SHA256: Optional[str] = None
 DEFAULT_WEIGHTS_DIR = Path("weights/stegastamp")
 
@@ -36,40 +41,100 @@ def try_import_tensorflow() -> Tuple[Optional[Any], Optional[str]]:
         return None, str(e)
 
 
-def ensure_stegastamp_weights(
-    weights_dir: str | Path = DEFAULT_WEIGHTS_DIR,
-    *,
-    expected_sha256: Optional[str] = STEGA_ARCHIVE_SHA256,
-) -> Path:
-    """Download and extract the official Berkeley ``saved_models.tar.xz`` if needed."""
-    weights_dir = Path(weights_dir)
-    model_dir = weights_dir / "stegastamp_pretrained"
-    if (model_dir / "saved_model.pb").is_file() or list(model_dir.glob("*.pb")):
-        return model_dir
-    weights_dir.mkdir(parents=True, exist_ok=True)
-    archive = weights_dir / "saved_models.tar.xz"
-    if not archive.is_file():
-        print(f"[stegastamp] downloading official weights from {STEGA_WEIGHTS_URL}")
-        urllib.request.urlretrieve(STEGA_WEIGHTS_URL, filename=str(archive))
-    digest = file_sha256(archive)
-    if expected_sha256 and digest != expected_sha256:
-        raise RuntimeError(
-            f"StegaStamp archive sha256 mismatch: got {digest}, expected {expected_sha256}"
-        )
-    print(f"[stegastamp] archive sha256={digest}")
-    with tarfile.open(archive, "r:xz") as tar:
-        tar.extractall(path=weights_dir)
-    # Official archive lays out ``saved_models/stegastamp_pretrained``.
+def _find_stegastamp_model_dir(weights_dir: Path) -> Optional[Path]:
     candidates = [
         weights_dir / "stegastamp_pretrained",
         weights_dir / "saved_models" / "stegastamp_pretrained",
     ]
     for c in candidates:
-        if c.is_dir():
+        if (c / "saved_model.pb").is_file() or list(c.glob("*.pb")):
             return c
-    raise FileNotFoundError(
-        f"Could not locate stegastamp_pretrained under {weights_dir} after extraction"
+    return None
+
+
+def _download_stegastamp_from_hf(weights_dir: Path) -> Path:
+    """Fetch the TF SavedModel folder from the Hugging Face community mirror."""
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError as e:
+        raise ImportError(
+            "huggingface_hub is required to download StegaStamp weights from the "
+            f"HF mirror ({STEGA_HF_REPO}). Install it or place stegastamp_pretrained "
+            f"under {weights_dir}."
+        ) from e
+
+    print(
+        f"[stegastamp] Berkeley archive unavailable; downloading TF SavedModel "
+        f"from Hugging Face ({STEGA_HF_REPO})"
     )
+    snapshot_download(
+        repo_id=STEGA_HF_REPO,
+        allow_patterns=list(STEGA_HF_ALLOW),
+        local_dir=str(weights_dir),
+    )
+    found = _find_stegastamp_model_dir(weights_dir)
+    if found is None:
+        raise FileNotFoundError(
+            f"HF snapshot of {STEGA_HF_REPO} did not contain stegastamp_pretrained "
+            f"under {weights_dir}"
+        )
+    return found
+
+
+def ensure_stegastamp_weights(
+    weights_dir: str | Path = DEFAULT_WEIGHTS_DIR,
+    *,
+    expected_sha256: Optional[str] = STEGA_ARCHIVE_SHA256,
+) -> Path:
+    """Download official StegaStamp TF SavedModel weights if needed.
+
+    Prefers the authors' Berkeley ``saved_models.tar.xz``. When that host is down
+    (404), falls back to the Hugging Face community mirror of the same SavedModel.
+    """
+    weights_dir = Path(weights_dir)
+    existing = _find_stegastamp_model_dir(weights_dir)
+    if existing is not None:
+        return existing
+
+    weights_dir.mkdir(parents=True, exist_ok=True)
+    archive = weights_dir / "saved_models.tar.xz"
+    berkeley_err: Optional[BaseException] = None
+
+    if not archive.is_file():
+        try:
+            print(f"[stegastamp] downloading official weights from {STEGA_WEIGHTS_URL}")
+            urllib.request.urlretrieve(STEGA_WEIGHTS_URL, filename=str(archive))
+        except (urllib.error.HTTPError, urllib.error.URLError, OSError) as e:
+            berkeley_err = e
+            if archive.is_file():
+                archive.unlink()
+            print(f"[stegastamp] Berkeley download failed: {e}")
+
+    if archive.is_file():
+        digest = file_sha256(archive)
+        if expected_sha256 and digest != expected_sha256:
+            raise RuntimeError(
+                f"StegaStamp archive sha256 mismatch: got {digest}, expected {expected_sha256}"
+            )
+        print(f"[stegastamp] archive sha256={digest}")
+        with tarfile.open(archive, "r:xz") as tar:
+            tar.extractall(path=weights_dir)
+        found = _find_stegastamp_model_dir(weights_dir)
+        if found is not None:
+            return found
+        print(
+            "[stegastamp] archive extracted but stegastamp_pretrained not found; "
+            "trying HF mirror"
+        )
+
+    try:
+        return _download_stegastamp_from_hf(weights_dir)
+    except Exception as hf_err:
+        detail = f"Berkeley={berkeley_err!r}; HF={hf_err!r}" if berkeley_err else repr(hf_err)
+        raise FileNotFoundError(
+            "Could not obtain StegaStamp SavedModel weights. "
+            f"Place stegastamp_pretrained/ under {weights_dir} manually. ({detail})"
+        ) from hf_err
 
 
 class StegaStampBaseline(BaselineScheme):
@@ -90,7 +155,8 @@ class StegaStampBaseline(BaselineScheme):
             raise ImportError(
                 "StegaStamp official weights are a TensorFlow SavedModel. "
                 "Install TensorFlow to evaluate this baseline:\n"
-                "  pip install 'tensorflow>=2.12'\n"
+                "  python scripts/install_baselines.py --scheme stegastamp\n"
+                "  # or: pip install 'tensorflow>=2.12'\n"
                 f"Import error: {err}"
             )
         self.tf = tf
@@ -102,18 +168,17 @@ class StegaStampBaseline(BaselineScheme):
             else ""
         )
         # TF1 SavedModel via compat.v1 session (as in authors' encode_image.py).
+        # Use string tags/keys — TF2 removed tf.saved_model.signature_constants.
         tf.compat.v1.disable_eager_execution()
         self._graph = tf.Graph()
         self._sess = tf.compat.v1.Session(graph=self._graph)
         with self._graph.as_default():
             meta = tf.compat.v1.saved_model.loader.load(
                 self._sess,
-                [tf.saved_model.SERVING],
+                ["serve"],
                 str(self.model_dir),
             )
-            sig = meta.signature_def[
-                tf.saved_model.signature_constants.DEFAULT_SERVING_SIGNATURE_DEF_KEY
-            ]
+            sig = meta.signature_def["serving_default"]
             self._secret_name = sig.inputs["secret"].name
             self._image_name = sig.inputs["image"].name
             self._stego_name = sig.outputs["stegastamp"].name
@@ -183,7 +248,8 @@ class StegaStampBaseline(BaselineScheme):
                 "model_dir": str(self.model_dir).replace("\\", "/"),
             },
             notes=(
-                f"Weights from {STEGA_WEIGHTS_URL} (authors' README). "
+                f"Primary URL {STEGA_WEIGHTS_URL} (authors' README); "
+                f"fallback HF mirror {STEGA_HF_REPO} (TF SavedModel only). "
                 "Embed at 400×400 then residual-upsample to evaluation resolution "
                 "(authors' encode_image.py saves residual for the same purpose)."
             ),

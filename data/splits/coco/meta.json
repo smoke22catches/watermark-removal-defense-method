@@ -1,0 +1,24 @@
+{
+  "counts": {
+    "test": 5000,
+    "train": 117287,
+    "val": 1000
+  },
+  "data_root": "data",
+  "dataset": "coco",
+  "extra": {
+    "test_size": 5000,
+    "train_max": null,
+    "train_root": "coco/train2017",
+    "val_from_train": true,
+    "val_root": "coco/train2017",
+    "val_size": 1000,
+    "val_test_root": "coco/val2017"
+  },
+  "split_hashes": {
+    "test.txt": "3f5d60eb7b17f708cf1bc8b021b175bc8360affdf9be56704148ef2c0ba7b7b6",
+    "train.txt": "d1f00b082835050a75f34bcba8f0ec2a7c295633c3ede1caa6153a9a9643cfec",
+    "val.txt": "1ea4c8c158539a39963191dbfb2d48a575c5a8171d6fb233714f1b19c9d7972b"
+  },
+  "split_seed": 20241010
+}

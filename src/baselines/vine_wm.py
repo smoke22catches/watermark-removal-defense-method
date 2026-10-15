@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import types
 from typing import Any, Dict, Optional, Tuple
 
 import torch
@@ -22,20 +23,65 @@ VINE_DEC_ID = "Shilin-LU/VINE-R-Dec"
 
 
 def try_import_vine() -> Tuple[Optional[Any], Optional[Any], Optional[str]]:
-    try:
-        from vine_turbo import VINE_Turbo  # type: ignore
-        from stega_encoder_decoder import CustomConvNeXt  # type: ignore
+    """Import VINE encoder/decoder classes from the official package layout.
 
-        return VINE_Turbo, CustomConvNeXt, None
-    except Exception as e:
+    Official ``pip install git+https://github.com/Shilin-LU/VINE`` installs a
+    ``vine`` package whose modules live under ``vine.src.*``. Older layouts (flat
+    modules on ``sys.path``) are still tried for local checkouts.
+    """
+    errors: list[str] = []
+    candidates = (
+        ("vine.src.vine_turbo", "vine.src.stega_encoder_decoder"),
+        ("vine.vine_turbo", "vine.stega_encoder_decoder"),
+        ("vine_turbo", "stega_encoder_decoder"),
+    )
+    for enc_mod, dec_mod in candidates:
         try:
-            # Some installs expose the package as ``vine``.
-            from vine.vine_turbo import VINE_Turbo  # type: ignore
-            from vine.stega_encoder_decoder import CustomConvNeXt  # type: ignore
+            import importlib
 
+            VINE_Turbo = getattr(importlib.import_module(enc_mod), "VINE_Turbo")
+            CustomConvNeXt = getattr(importlib.import_module(dec_mod), "CustomConvNeXt")
             return VINE_Turbo, CustomConvNeXt, None
-        except Exception as e2:
-            return None, None, f"{e}; {e2}"
+        except Exception as e:
+            errors.append(f"{enc_mod}/{dec_mod}: {e}")
+    return None, None, "; ".join(errors)
+
+
+def _patch_vine_turbo_batched_forward(encoder: torch.nn.Module) -> None:
+    """Expand VINE's batch-1 timestep / text-embed caches to the input batch.
+
+    Upstream ``VINE_Turbo.forward`` keeps ``timesteps`` and ``fixed_a2b_emb_base``
+    at batch size 1. That works for single-image demos but breaks UNet attention
+    when evaluation uses ``batch_size > 1`` (default 8): cross-attn / residual
+    shapes disagree (e.g. 8192 vs 1024). Expand both tensors to ``B`` before the
+    UNet call; keep the authors' per-sample scheduler loop otherwise unchanged.
+    """
+
+    def forward(self, x, secret=None, timesteps=None):
+        if timesteps is None:
+            timesteps = self.timesteps
+        B = int(x.shape[0])
+        if int(timesteps.shape[0]) != B:
+            timesteps = timesteps[:1].expand(B)
+        emb = self.fixed_a2b_emb_base
+        if int(emb.shape[0]) != B:
+            emb = emb[:1].expand(B, -1, -1)
+        x_sec = self.sec_encoder(secret, x)
+        x_enc = self.vae_enc(x_sec, direction="a2b").to(x.dtype)
+        model_pred = self.unet(
+            x_enc, timesteps, encoder_hidden_states=emb
+        ).sample.to(x.dtype)
+        x_out = torch.stack(
+            [
+                self.sched.step(
+                    model_pred[i], timesteps[i], x_enc[i], return_dict=True
+                ).prev_sample
+                for i in range(B)
+            ]
+        )
+        return self.vae_dec(x_out, direction="a2b").to(x.dtype)
+
+    encoder.forward = types.MethodType(forward, encoder)
 
 
 class VINEBaseline(BaselineScheme):
@@ -55,14 +101,19 @@ class VINEBaseline(BaselineScheme):
         VINE_Turbo, CustomConvNeXt, err = try_import_vine()
         if VINE_Turbo is None or CustomConvNeXt is None:
             raise ImportError(
-                "VINE package is not installed. Install the official release:\n"
-                "  pip install 'git+https://github.com/Shilin-LU/VINE'\n"
+                "VINE package is not installed. Install via the project helper "
+                "(avoids VINE's pinned torch==2.0.1 clobbering this env):\n"
+                "  python scripts/install_baselines.py --scheme vine\n"
+                "  # or manually: pip install --no-deps "
+                "'git+https://github.com/Shilin-LU/VINE' && pip install peft\n"
                 f"Import error: {err}"
             )
         self.device = device
         self.encoder_id = encoder_id
         self.decoder_id = decoder_id
-        self._encoder = VINE_Turbo.from_pretrained(encoder_id).to(device).eval()
+        # HF config defaults device=cuda; override so CPU probing works.
+        self._encoder = VINE_Turbo.from_pretrained(encoder_id, device=device).to(device).eval()
+        _patch_vine_turbo_batched_forward(self._encoder)
         self._decoder = CustomConvNeXt.from_pretrained(decoder_id).to(device).eval()
 
     def embed(self, images: torch.Tensor, bits: torch.Tensor) -> torch.Tensor:

@@ -176,15 +176,20 @@ def test_coco_test_split_size_5000() -> None:
         root = Path(tmp)
         data_root = root / "data"
         splits_dir = root / "splits"
+        # Real COCO layout: val2017 has exactly 5000 images (not 6000).
         _make_coco_tree(
             data_root,
-            n_train=20,
-            n_val=COCO_VAL_SIZE + COCO_TEST_SIZE,
+            n_train=COCO_VAL_SIZE + 20,
+            n_val=COCO_TEST_SIZE,
         )
         spec = generate_coco_splits(
             data_root, splits_dir, split_seed=DEFAULT_SPLIT_SEED
         )
         assert len(spec.test_paths) == 5000
+        assert len(spec.val_paths) == COCO_VAL_SIZE
+        assert all(p.startswith("coco/val2017/") for p in spec.test_paths)
+        assert all(p.startswith("coco/train2017/") for p in spec.val_paths)
+        assert all(p.startswith("coco/train2017/") for p in spec.train_paths)
         assert (splits_dir / "coco" / "test.txt").read_text(encoding="utf-8").count(
             "\n"
         ) == 5000
@@ -192,6 +197,28 @@ def test_coco_test_split_size_5000() -> None:
         meta = json.loads((splits_dir / "coco" / "meta.json").read_text(encoding="utf-8"))
         live = list_file_hash(splits_dir / "coco" / "test.txt")
         assert meta["split_hashes"]["test.txt"] == live
+        assert meta["extra"]["val_from_train"] is True
+
+
+def test_coco_both_from_val_when_pool_large_enough() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        data_root = root / "data"
+        splits_dir = root / "splits"
+        _make_coco_tree(
+            data_root,
+            n_train=30,
+            n_val=COCO_VAL_SIZE + COCO_TEST_SIZE,
+        )
+        spec = generate_coco_splits(
+            data_root, splits_dir, split_seed=DEFAULT_SPLIT_SEED
+        )
+        assert len(spec.test_paths) == COCO_TEST_SIZE
+        assert len(spec.val_paths) == COCO_VAL_SIZE
+        assert all(p.startswith("coco/val2017/") for p in spec.val_paths)
+        assert all(p.startswith("coco/val2017/") for p in spec.test_paths)
+        meta = json.loads((splits_dir / "coco" / "meta.json").read_text(encoding="utf-8"))
+        assert meta["extra"]["val_from_train"] is False
 
 
 def test_write_list_file_deterministic_hash() -> None:
@@ -213,7 +240,9 @@ if __name__ == "__main__":
     test_infer_same_test_list_and_overlap_abort()
     print("[ok] infer same test list + overlap abort")
     test_coco_test_split_size_5000()
-    print("[ok] coco test size 5000")
+    print("[ok] coco test size 5000 (real val2017 layout)")
+    test_coco_both_from_val_when_pool_large_enough()
+    print("[ok] coco both from val when pool large enough")
     test_write_list_file_deterministic_hash()
     print("[ok] list file hash")
     print("=== all data-split acceptance tests passed ===")

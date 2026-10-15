@@ -31,15 +31,34 @@ weights load successfully (`src/baselines/factory.py`). There is no hard-coded
 - **Metadata:** `results_meta.json` records `scheme`, `msg_len`,
   `native_resolution`, and `weight_source` (URL, license, version, checksums).
 
+## Install helpers
+
+```bash
+# Packages + weights for all post-hoc baselines (recommended)
+python scripts/install_baselines.py
+
+# Or: install packages then verify / fetch weights
+python scripts/install_baselines.py --scheme trustmark
+python scripts/download_baselines.py --scheme trustmark
+# One-shot: install then probe
+python scripts/download_baselines.py --scheme all --install
+```
+
+`install_baselines.py` clones VINE into `third_party/VINE` and installs it with
+`--no-deps` so VINE's pinned `torch==2.0.1` does not replace this project's CUDA
+12.4 stack. TrustMark comes from PyPI; StegaStamp needs TensorFlow for the
+SavedModel runtime.
+
 ## StegaStamp
 
 | Field | Value |
 |-------|--------|
 | Paper | Tancik, Mildenhall, Ng — *StegaStamp: Invisible Hyperlinks in Physical Photographs*, CVPR 2020 |
 | Code | https://github.com/tancik/StegaStamp (MIT) |
-| Weights | Official Berkeley archive linked from the authors' README: `http://people.eecs.berkeley.edu/~tancik/stegastamp/saved_models.tar.xz` |
+| Weights (primary) | Authors' Berkeley archive: `http://people.eecs.berkeley.edu/~tancik/stegastamp/saved_models.tar.xz` (often **404** as of 2026) |
+| Weights (fallback) | Hugging Face community mirror of the **same TF SavedModel**: `KingTechnician/stegastamp` → `stegastamp_pretrained/` (not the PyTorch `encoder.pth` in that repo) |
 | Weight file | `saved_models/stegastamp_pretrained` (TensorFlow SavedModel) |
-| Checksum | SHA-256 of the `.tar.xz` is computed on first download and stored under `weights/stegastamp/` / `results_meta.json`. Re-run `python scripts/download_baselines.py --scheme stegastamp` to print the digest. **Do not substitute third-party PyTorch re-trains** (e.g. community HF ports) without documenting them here as unofficial. |
+| Checksum | SHA-256 of the `.tar.xz` is computed when the Berkeley archive downloads successfully. HF folder downloads record paths in `results_meta.json` instead. **Do not substitute third-party PyTorch re-trains** without documenting them here as unofficial. |
 | License | MIT (repository `LICENSE`) |
 | Runtime | Requires `tensorflow>=2.12` (TF1 SavedModel via `tf.compat.v1`). |
 | Resolution | Native **400×400**; residual upsampled to eval size. |
@@ -47,8 +66,10 @@ weights load successfully (`src/baselines/factory.py`). There is no hard-coded
 Install:
 
 ```bash
-pip install "tensorflow>=2.12"
-python scripts/download_baselines.py --scheme stegastamp
+python scripts/install_baselines.py --scheme stegastamp
+# equivalent:
+#   pip install "tensorflow>=2.12"
+#   python scripts/download_baselines.py --scheme stegastamp
 ```
 
 ## TrustMark
@@ -67,7 +88,8 @@ python scripts/download_baselines.py --scheme stegastamp
 Install:
 
 ```bash
-pip install trustmark
+python scripts/install_baselines.py --scheme trustmark
+# equivalent: pip install trustmark
 # Windows encoding issues: pip install "git+https://github.com/adobe/trustmark.git#subdirectory=python"
 ```
 
@@ -87,10 +109,12 @@ Evaluation uses **raw 100-bit** payloads (`use_ECC=False`) so random messages ma
 Install:
 
 ```bash
-pip install "git+https://github.com/Shilin-LU/VINE"
+python scripts/install_baselines.py --scheme vine
+# Do NOT use bare `pip install git+https://github.com/Shilin-LU/VINE` in this
+# env — setup.py pins torch==2.0.1. The helper uses --no-deps + peft only.
 ```
 
-VINE pulls a large SDXL-Turbo-based encoder; first run downloads several GB from Hugging Face.
+VINE pulls a large SD-Turbo-based encoder; first run downloads several GB from Hugging Face.
 
 ## Not applicable (generation-time)
 

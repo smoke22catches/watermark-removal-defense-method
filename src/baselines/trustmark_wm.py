@@ -58,8 +58,9 @@ class TrustMarkBaseline(BaselineScheme):
         TrustMark, err = try_import_trustmark()
         if TrustMark is None:
             raise ImportError(
-                "TrustMark package is not installed. Install the official release:\n"
-                "  pip install trustmark\n"
+                "TrustMark package is not installed. Install via:\n"
+                "  python scripts/install_baselines.py --scheme trustmark\n"
+                "  # or: pip install trustmark\n"
                 "  # or: pip install 'git+https://github.com/adobe/trustmark.git#subdirectory=python'\n"
                 f"Import error: {err}"
             )

@@ -29,8 +29,7 @@ dependencies:
       - safetensors==0.5.2
       - einops==0.8.1
       - compressai==1.2.6
-      # Optional comparative baselines (see docs/baselines.md):
-      # - trustmark  (Adobe TrustMark; or: pip install git+https://github.com/adobe/trustmark.git#subdirectory=python)
-      # - tensorflow>=2.12  (official StegaStamp SavedModel)
-      # - git+https://github.com/Shilin-LU/VINE  (VINE-R encoder/decoder)
+      # Optional comparative baselines — install with:
+      #   python scripts/install_baselines.py
+      # (see docs/baselines.md). Do not pip-install VINE with deps; it pins torch==2.0.1.
       - pytest

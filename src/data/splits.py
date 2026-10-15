@@ -193,6 +193,17 @@ def generate_coco_splits(
     val_size: int = COCO_VAL_SIZE,
     test_size: int = COCO_TEST_SIZE,
 ) -> SplitSpec:
+    """Build COCO train/val/test lists.
+
+    Official ``val2017`` has exactly 5,000 images. Defaults request test=5,000, so
+    both val and test cannot come from ``val2017``. Policy:
+
+    * If ``val2017`` is large enough for ``val_size + test_size``, draw both from it
+      (disjoint).
+    * Otherwise (real COCO): use ``val2017`` for **test** only, and hold out
+      ``val_size`` images from ``train2017`` for validation (same pattern as DIV2K /
+      Imagenette). Train and test remain in different folders.
+    """
     train_root = resolve_role_root(data_root, "coco", "train")
     val_root = resolve_role_root(data_root, "coco", "val")
     if train_root is None or val_root is None:
@@ -200,19 +211,43 @@ def generate_coco_splits(
             "COCO train2017 and val2017 are required to generate splits. "
             "Run: python scripts/download_data.py --dataset coco"
         )
-    train_imgs = [rel_posix(p, data_root) for p in collect_images(train_root)]
+    train_pool = [rel_posix(p, data_root) for p in collect_images(train_root)]
     val_pool = [rel_posix(p, data_root) for p in collect_images(val_root)]
-    train_imgs = _shuffle(train_imgs, split_seed)
+    train_pool = _shuffle(train_pool, split_seed)
     if train_max is not None:
-        train_imgs = train_imgs[: int(train_max)]
+        train_pool = train_pool[: int(train_max)]
     val_pool = _shuffle(val_pool, split_seed + 1)
-    if len(val_pool) < val_size + test_size:
-        raise RuntimeError(
-            f"COCO val pool has {len(val_pool)} images; need val_size+test_size="
-            f"{val_size + test_size} (val={val_size}, test={test_size})"
+
+    val_from_train = False
+    if len(val_pool) >= val_size + test_size:
+        val_imgs = val_pool[:val_size]
+        test_imgs = val_pool[val_size : val_size + test_size]
+        train_imgs = train_pool
+        val_test_root = rel_posix(val_root, data_root)
+    else:
+        if len(val_pool) < test_size:
+            raise RuntimeError(
+                f"COCO val2017 has {len(val_pool)} images; need at least "
+                f"test_size={test_size}. "
+                "Run: python scripts/download_data.py --dataset coco"
+            )
+        if len(train_pool) <= val_size:
+            raise RuntimeError(
+                f"COCO train2017 has {len(train_pool)} images after train_max; "
+                f"need > val_size={val_size} to hold out a validation split"
+            )
+        # Real COCO: full val2017 → test; carve val from train2017.
+        test_imgs = val_pool[:test_size]
+        val_imgs = train_pool[:val_size]
+        train_imgs = train_pool[val_size:]
+        val_from_train = True
+        val_test_root = rel_posix(val_root, data_root)
+        print(
+            f"[splits] coco: val2017 has {len(val_pool)} < val+test="
+            f"{val_size + test_size}; using val2017 for test ({len(test_imgs)}) "
+            f"and holding out val={len(val_imgs)} from train2017"
         )
-    val_imgs = val_pool[:val_size]
-    test_imgs = val_pool[val_size : val_size + test_size]
+
     return _write_dataset_splits(
         "coco",
         data_root,
@@ -223,7 +258,13 @@ def generate_coco_splits(
         split_seed=split_seed,
         extra_meta={
             "train_root": rel_posix(train_root, data_root),
-            "val_test_root": rel_posix(val_root, data_root),
+            "val_test_root": val_test_root,
+            "val_root": (
+                rel_posix(train_root, data_root)
+                if val_from_train
+                else rel_posix(val_root, data_root)
+            ),
+            "val_from_train": val_from_train,
             "val_size": val_size,
             "test_size": test_size,
             "train_max": train_max,

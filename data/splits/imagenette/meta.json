@@ -1,0 +1,20 @@
+{
+  "counts": {
+    "test": 3925,
+    "train": 8969,
+    "val": 500
+  },
+  "data_root": "data",
+  "dataset": "imagenette",
+  "extra": {
+    "test_root": "imagenette/imagenette2-320/val",
+    "train_root": "imagenette/imagenette2-320/train",
+    "val_size": 500
+  },
+  "split_hashes": {
+    "test.txt": "d37055b608bfc0d60a21d1a8ab903e9fcc1c61e7afe2905466b425fa12b923a2",
+    "train.txt": "d531c5cec6cddd33f338df88776b658ec15b8bfc3aa95f25c5f92e4e552db821",
+    "val.txt": "0866146ef1218ae3fe47e841cc77273ff20ac3ff3380c4826c84000427161642"
+  },
+  "split_seed": 20241010
+}

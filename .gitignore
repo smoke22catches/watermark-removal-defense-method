@@ -1,6 +1,9 @@
 # Downloaded baseline weights (StegaStamp archive, etc.)
 weights/
 
+# Cloned baseline repos (VINE editable install via scripts/install_baselines.py)
+third_party/
+
 # Data and checkpoints (large / regenerable)
 # Ignore dataset blobs under data/, but keep fixed split lists versioned.
 data/*

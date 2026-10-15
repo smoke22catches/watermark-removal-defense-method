@@ -48,8 +48,9 @@ python scripts/make_splits.py --dataset all --data-root ./data --split-seed 2024
 python scripts/make_splits.py --verify   # re-hash committed lists
 ```
 
-- COCO: train from `train2017`; val/test are disjoint fixed subsets of `val2017`
-  (test = 5,000 images).
+- COCO: train from `train2017` (minus a held-out val slice of 1,000); test = all
+  of `val2017` (5,000 images). If `val2017` were large enough for val+test, both
+  would be drawn from it instead.
 - DIV2K: train from `DIV2K_train_HR`, test from `DIV2K_valid_HR`.
 - Imagenette: train from `train/`, test from `val/`.
 
@@ -83,6 +84,7 @@ python scripts/infer.py --checkpoint runs/<run>/checkpoints/best.pt \
   --run-name eval_coco
 
 # Comparative baselines (TrustMark / StegaStamp / VINE) — see docs/baselines.md
+python scripts/install_baselines.py          # packages + weights (once)
 python scripts/infer.py --scheme trustmark --dataset coco --device cuda \
   --image-size 256 --sweep-strengths --run-name eval_trustmark
 
