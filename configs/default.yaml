@@ -34,6 +34,8 @@ lr: 2.0e-3
 epochs: 100
 # Keep perceptual weight low so decode loss can form a watermark channel first.
 lambda_perc: 0.05
+# How often to run train-time validation (epochs). Attack sweep cost dominates;
+# prefer a large gap + quick/full split under eval.* below.
 val_every: 5
 resume: null  # path | run-dir | auto
 ckpt_every_iters: 500
@@ -130,10 +132,16 @@ baselines:
 eval:
   # Full protocol for scripts/infer.py (includes heavy DiffPure / rinse / compressai).
   attacks: [clean, jpeg, rotate, crop, noise, unseen_blur, regen_proxy, guided_regen, diffpure, rinse_2, rinse_4, bmshj2018, cheng2020, adv]
-  # Train-time validation only (scripts/train.py). Omits rinse_*/diffpure/compressai —
-  # those can look "stuck" for a long time after the previous attack's log line
-  # (rinse_4 = 4 × diffpure_steps UNet passes per image, no intermediate summary).
+  # Train-time validation (scripts/train.py). Omits rinse_*/diffpure/compressai.
   val_attacks: [clean, jpeg, rotate, crop, noise, unseen_blur, regen_proxy, guided_regen, adv]
+  # Most val epochs use this cheap subset (enough for bit_acc_clean / early stopping).
+  val_attacks_quick: [clean, jpeg]
+  # Run full val_attacks every N epochs (and on the last epoch). 0 = always full.
+  val_full_every: 20
+  # Cap val loader batches (null = full val split). Speeds monitoring a lot on COCO.
+  val_max_batches: 32
+  # LPIPS/SSIM/PSNR during train val (slow). Final quality belongs in infer.py.
+  val_compute_quality: false
   # DiffPure / rinse use a DIFFERENT diffusion checkpoint than regen.sd_model_id.
   diffpure_model_id: CompVis/stable-diffusion-v1-4
   diffpure_steps: 50

@@ -64,6 +64,21 @@ def _needs_grad(attack_id: str) -> bool:
     return attack_id in ("adv", "guided_regen")
 
 
+def _iter_batches(loader: DataLoader, max_batches: Optional[int] = None):
+    """Yield loader batches, optionally capped for fast train-time validation."""
+    for i, batch in enumerate(loader):
+        if max_batches is not None and i >= int(max_batches):
+            break
+        yield batch
+
+
+def _batch_count(loader: DataLoader, max_batches: Optional[int] = None) -> int:
+    n = len(loader)
+    if max_batches is None:
+        return n
+    return max(0, min(n, int(max_batches)))
+
+
 def evaluate_protocol(
     encoder: nn.Module,
     decoder: nn.Module,
@@ -81,6 +96,7 @@ def evaluate_protocol(
     compute_fid: bool = True,
     compute_quality: bool = True,
     quality_only: bool = False,
+    max_batches: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     """Full evaluation protocol → long-format rows (bit-acc, pert norms, LPIPS, …)."""
     config = config or {}
@@ -100,12 +116,13 @@ def evaluate_protocol(
     # Identical seeded bit sampling for every scheme (reproducible across baselines).
     msg_gen = torch.Generator(device="cpu")
     msg_gen.manual_seed(int(seed) + 17_389)
+    n_batches = _batch_count(val_loader, max_batches)
 
     # Clean, never-watermarked detection statistics (shared across attacks).
     clean_stats: List[float] = []
     if compute_detection and det_ok:
         with torch.no_grad():
-            for batch in val_loader:
+            for batch in _iter_batches(val_loader, max_batches):
                 x = batch[0].to(device)
                 m_ref = sample_bits(x.size(0), k, device=device, generator=msg_gen)
                 logits_clean = decoder(x)
@@ -138,7 +155,6 @@ def evaluate_protocol(
             strengths = (float(grid[len(grid) // 2]),)
 
         for strength in strengths:
-            n_batches = len(val_loader)
             # Heavy regen attacks can take many minutes per strength with no other
             # output; announce start so the run does not look wedged after the
             # previous attack's summary line (e.g. after rinse_2 → rinse_4).
@@ -169,7 +185,7 @@ def evaluate_protocol(
                 "bmshj2018",
                 "cheng2020",
             )
-            for batch_idx, batch in enumerate(val_loader):
+            for batch_idx, batch in enumerate(_iter_batches(val_loader, max_batches)):
                 x = batch[0].to(device)
                 m = sample_bits(x.size(0), k, device=device, generator=msg_gen)
                 with torch.no_grad():

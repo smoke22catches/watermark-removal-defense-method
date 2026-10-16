@@ -72,9 +72,11 @@ python scripts/train.py --dataset coco --device cuda --epochs 100 --batch-size 8
   --run-name coco_v1
 ```
 
-Periodic train validation uses `eval.val_attacks` (lightweight). The full suite
-including `rinse_4` / DiffPure / CompressAI is `eval.attacks` for `scripts/infer.py`
-only — running `rinse_4` mid-training looks stuck after the `rinse_2` log line.
+Periodic train validation uses a quick/full split (`eval.val_attacks_quick` most
+`val_every` epochs; `eval.val_attacks` every `eval.val_full_every` epochs), capped by
+`eval.val_max_batches`. Do **not** drop DistortionBank/regen/PGD from the training
+step — that is the learning signal. The full WAVES suite (`rinse_4` / DiffPure /
+CompressAI) stays on `eval.attacks` for `scripts/infer.py` only.
 
 Common overrides: `--lr`, `--msg-len`, `--lambda-perc`, `--regen-steps`, `--resume`,
 `--num-workers`, `--set key=value` (dotted keys into `configs/default.yaml`).

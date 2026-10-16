@@ -5,7 +5,7 @@ from __future__ import annotations
 import signal
 import time
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -513,23 +513,31 @@ def train(
         "guided_regen",
         "adv",
     ]
+    _default_quick = ["clean", "jpeg"]
     _heavy_val = {"diffpure", "rinse_2", "rinse_4", "bmshj2018", "cheng2020"}
-    if eval_cfg.get("val_attacks") is not None:
-        eval_attacks = list(eval_cfg["val_attacks"])
-    else:
-        raw = list(eval_cfg.get("attacks") or _default_val)
-        # Legacy configs stuffed the full infer suite into eval.attacks; strip the
-        # multi-minute DiffPure/rinse/compressai passes unless val_attacks is set.
-        if any(a in _heavy_val for a in raw):
-            eval_attacks = [a for a in raw if a not in _heavy_val] or list(_default_val)
+
+    def _resolve_val_attacks(raw: Sequence[str]) -> List[str]:
+        attacks = list(raw)
+        if any(a in _heavy_val for a in attacks):
+            stripped = [a for a in attacks if a not in _heavy_val] or list(_default_val)
             print(
                 "[train] train-time val omits heavy attacks "
-                f"{sorted(_heavy_val & set(raw))}; "
+                f"{sorted(_heavy_val & set(attacks))}; "
                 "use scripts/infer.py or set eval.val_attacks to override",
                 flush=True,
             )
-        else:
-            eval_attacks = raw
+            return stripped
+        return attacks
+
+    if eval_cfg.get("val_attacks") is not None:
+        eval_attacks_full = list(eval_cfg["val_attacks"])
+    else:
+        eval_attacks_full = _resolve_val_attacks(eval_cfg.get("attacks") or _default_val)
+    eval_attacks_quick = list(eval_cfg.get("val_attacks_quick") or _default_quick)
+    val_full_every = int(eval_cfg.get("val_full_every", 0) or 0)
+    val_max_batches = eval_cfg.get("val_max_batches")
+    val_max_batches_i = int(val_max_batches) if val_max_batches is not None else None
+    val_compute_quality = bool(eval_cfg.get("val_compute_quality", False))
 
     enc_params = count_parameters(encoder)
     dec_params = count_parameters(decoder)
@@ -553,7 +561,11 @@ def train(
             f"beta={gh['beta_guided']} J={gh['J_guided']}; "
             f"ckpt_every_iters={ckpt_every} amp={use_amp} "
             f"num_workers={num_workers} pin_memory={bool(pin_memory)} "
-            f"log_every_iters={log_every} config_hash={cfg_hash}"
+            f"log_every_iters={log_every} "
+            f"val_every={val_every} val_full_every={val_full_every} "
+            f"val_max_batches={val_max_batches_i} "
+            f"val_quick={eval_attacks_quick} val_full={eval_attacks_full} "
+            f"config_hash={cfg_hash}"
         )
 
     def _save_ckpt(*, also_best: bool = False) -> None:
@@ -804,6 +816,20 @@ def train(
         ]
 
         if val_every > 0 and (epoch % val_every == 0 or epoch == epochs - 1):
+            # Quick val most epochs; full train-time attack suite sparsely (and last).
+            is_last = epoch == epochs - 1
+            use_full = (
+                val_full_every <= 0
+                or is_last
+                or (epoch % val_full_every == 0)
+            )
+            eval_attacks = eval_attacks_full if use_full else eval_attacks_quick
+            mode = "full" if use_full else "quick"
+            if logger:
+                logger.log(
+                    f"[val] epoch={epoch} mode={mode} attacks={eval_attacks} "
+                    f"max_batches={val_max_batches_i} quality={val_compute_quality}"
+                )
             eval_rows = evaluate_protocol(
                 encoder,
                 decoder,
@@ -819,7 +845,8 @@ def train(
                 sweep_strengths=False,
                 compute_detection=False,
                 compute_fid=False,
-                compute_quality=True,
+                compute_quality=val_compute_quality,
+                max_batches=val_max_batches_i,
             )
             # Stamp global_step for dedup on resume.
             for row in eval_rows:
