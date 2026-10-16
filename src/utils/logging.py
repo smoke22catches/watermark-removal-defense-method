@@ -78,13 +78,16 @@ class RunLogger:
         metrics_filename: str = "metrics.csv",
         long_format: bool = True,
         append_metrics: bool = True,
+        metrics_flush_every: int = 50,
     ) -> None:
         self.run_dir = Path(run_dir)
         self.metrics_path = self.run_dir / metrics_filename
         self.log_path = self.run_dir / "log.txt"
         self.long_format = long_format
+        self.metrics_flush_every = max(1, int(metrics_flush_every))
         self._fieldnames: Optional[List[str]] = list(LONG_FIELDS) if long_format else None
         self._seen_keys: set = set()
+        self._pending_rows: List[Mapping[str, Any]] = []
         if append_metrics and self.metrics_path.exists():
             self._load_existing_keys()
         self._log_file = open(self.log_path, "a", encoding="utf-8")
@@ -118,19 +121,30 @@ class RunLogger:
         """Append a metrics row. Long-format rows must include ``metric_name``."""
         self.log_metric_rows([row])
 
-    def log_metric_rows(self, rows: Sequence[Mapping[str, Any]]) -> None:
+    def log_metric_rows(
+        self,
+        rows: Sequence[Mapping[str, Any]],
+        *,
+        flush: bool = False,
+    ) -> None:
         if not rows:
             return
-        new_rows: List[Mapping[str, Any]] = []
         for row in rows:
             key = _row_key(row)
             # Dedup when global_step is present; always allow blank-step rows once keyed.
             if key in self._seen_keys and str(row.get("global_step", "")) != "":
                 continue
             self._seen_keys.add(key)
-            new_rows.append(row)
-        if not new_rows:
+            self._pending_rows.append(row)
+        if flush or len(self._pending_rows) >= self.metrics_flush_every:
+            self.flush_metrics()
+
+    def flush_metrics(self) -> None:
+        """Write any buffered metric rows to disk."""
+        if not self._pending_rows:
             return
+        new_rows = self._pending_rows
+        self._pending_rows = []
         write_header = not self.metrics_path.exists()
         if self._fieldnames is None:
             self._fieldnames = list(new_rows[0].keys())
@@ -146,5 +160,6 @@ class RunLogger:
                 writer.writerow(dict(row))
 
     def close(self) -> None:
+        self.flush_metrics()
         sys.stdout = self._stdout
         self._log_file.close()

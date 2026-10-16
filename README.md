@@ -64,16 +64,20 @@ and aborts if the test list overlaps the training list stored in the checkpoint'
 ```bash
 # Minimal CPU dry-run (synthetic data, 2 epochs, placeholder regen proxy)
 python scripts/train.py --dataset synthetic --device cpu --epochs 2 --batch-size 2 \
-  --num-samples 8 --image-size 64 --run-name dryrun \
-  --set regen.use_placeholder=true
+  --num-samples 8 --image-size 64 --num-workers 0 --run-name dryrun \
+  --set regen.use_placeholder=true --set amp=false
 
-# GPU training on COCO
+# GPU training on COCO (defaults: amp, pin_memory, 8 workers — see configs/default.yaml)
 python scripts/train.py --dataset coco --device cuda --epochs 100 --batch-size 8 \
   --run-name coco_v1
 ```
 
 Common overrides: `--lr`, `--msg-len`, `--lambda-perc`, `--regen-steps`, `--resume`,
-`--set key=value` (dotted keys into `configs/default.yaml`).
+`--num-workers`, `--set key=value` (dotted keys into `configs/default.yaml`).
+
+If the GPU sits idle while `htop` shows the train process above 100% CPU, raise
+`--num-workers` (8–16), keep `amp=true`, and check `nvidia-smi` utilization — see
+the DataLoader / AMP knobs in `configs/default.yaml`.
 
 ## Evaluate / infer
 

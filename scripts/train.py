@@ -92,7 +92,12 @@ def main() -> None:
 
     set_seed(seed)
 
-    logger = RunLogger(run_dir, cfg, append_metrics=True)
+    logger = RunLogger(
+        run_dir,
+        cfg,
+        append_metrics=True,
+        metrics_flush_every=int(cfg.get("log_every_iters", 50)),
+    )
     logger.log(f"Run directory: {run_dir}")
     logger.log(f"seed={seed} regen_branch={cfg.get('regen_branch')} config_hash={config_hash(cfg)}")
 
@@ -120,6 +125,7 @@ def main() -> None:
     }
     dump_json(run_dir / "run_meta.json", meta)
 
+    device = str(cfg.get("device", "cuda"))
     train_loader, val_loader = build_dataloaders(
         dataset_name=str(cfg.get("dataset", "synthetic")),
         data_root=str(cfg.get("data_root", "./data")),
@@ -131,6 +137,10 @@ def main() -> None:
         seed=seed,
         splits_dir=str(cfg.get("splits_dir", DEFAULT_SPLITS_DIR)),
         split_seed=int(cfg.get("split_seed", DEFAULT_SPLIT_SEED)),
+        pin_memory=cfg.get("pin_memory"),
+        persistent_workers=cfg.get("persistent_workers"),
+        prefetch_factor=cfg.get("prefetch_factor"),
+        device=device,
     )
     split_info = getattr(train_loader, "split_info", {}) or {}
     meta["splits"] = {

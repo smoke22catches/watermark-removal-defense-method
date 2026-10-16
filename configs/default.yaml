@@ -10,7 +10,12 @@ data_root: ./data
 dataset: coco  # coco | div2k | imagenette | clic | synthetic
 image_size: 64
 batch_size: 8
-num_workers: 2
+# DataLoader: JPEG decode + Resize is CPU-bound; too few workers starve the GPU.
+# On an RTX 4090 server use 8–16; set 0 only for tiny CPU dry-runs / debugging.
+num_workers: 8
+pin_memory: true          # faster H2D when training on CUDA
+persistent_workers: true  # keep workers warm across epochs (requires num_workers > 0)
+prefetch_factor: 4         # batches prepared ahead per worker
 num_samples: null  # optional cap for quick tests (train only)
 val_fraction: 0.1  # ignored when data/splits exist (kept for CLI compat)
 # Fixed splits (seed-independent). Generate with scripts/make_splits.py.
@@ -32,7 +37,13 @@ lambda_perc: 0.05
 val_every: 5
 resume: null  # path | run-dir | auto
 ckpt_every_iters: 500
-amp: false
+# Mixed precision: Tensor Cores on Ada (4090). Kept off for CPU dry-runs automatically.
+amp: true
+# Cap PyTorch intra-op CPU threads so they do not fight DataLoader workers (htop >100%).
+# null → auto (min(4, default)) on CUDA; set explicitly e.g. 2–4 on busy servers.
+torch_num_threads: null
+# Write per-step train loss rows every N iters (CSV open/flush every step was a CPU bottleneck).
+log_every_iters: 50
 # Optional CosineAnnealingLR over total epochs; null = constant LR (still checkpointed).
 lr_scheduler: null  # null | cosine
 

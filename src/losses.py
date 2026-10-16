@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Tuple
 
 import torch
 import torch.nn as nn
@@ -15,26 +15,25 @@ class PerceptualLoss(nn.Module):
     def __init__(self, net: str = "alex", use_lpips: bool = True) -> None:
         super().__init__()
         self.use_lpips = use_lpips
-        self._lpips: Optional[nn.Module] = None
         if use_lpips:
             try:
                 import lpips
 
-                self._lpips = lpips.LPIPS(net=net)
-                for p in self._lpips.parameters():
+                net_mod = lpips.LPIPS(net=net)
+                for p in net_mod.parameters():
                     p.requires_grad_(False)
+                # Register so ``.to(device)`` moves LPIPS with the parent module.
+                self.add_module("_lpips", net_mod)
             except Exception:
                 # Fallback if lpips weights are unavailable (e.g. offline smoke test)
-                self._lpips = None
                 self.use_lpips = False
 
     def forward(self, x_w: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         loss_mse = F.mse_loss(x_w, x)
-        if self._lpips is not None:
+        lpips_net = getattr(self, "_lpips", None)
+        if lpips_net is not None:
             # LPIPS expects [-1, 1]; models already operate in that range.
-            device = x_w.device
-            self._lpips = self._lpips.to(device)
-            loss_lpips = self._lpips(x_w, x).mean()
+            loss_lpips = lpips_net(x_w, x).mean()
             return loss_mse + loss_lpips
         return loss_mse
 

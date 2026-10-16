@@ -264,6 +264,37 @@ def epoch_seed(seed: int, epoch: int) -> int:
     return int(seed) + int(epoch) * 1_000_003
 
 
+def dataloader_kwargs(
+    num_workers: int = 0,
+    *,
+    pin_memory: Optional[bool] = None,
+    persistent_workers: Optional[bool] = None,
+    prefetch_factor: Optional[int] = None,
+    device: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Shared DataLoader performance knobs for train / val / test.
+
+    ``pin_memory`` defaults to True when ``device`` looks like CUDA.
+    ``persistent_workers`` / ``prefetch_factor`` only apply when ``num_workers > 0``.
+    """
+    nw = max(0, int(num_workers))
+    if pin_memory is None:
+        pin_memory = bool(device is not None and str(device).startswith("cuda"))
+    kw: Dict[str, Any] = {
+        "num_workers": nw,
+        "pin_memory": bool(pin_memory),
+        "drop_last": False,
+    }
+    if nw > 0:
+        if persistent_workers is None:
+            persistent_workers = True
+        kw["persistent_workers"] = bool(persistent_workers)
+        if prefetch_factor is None:
+            prefetch_factor = 2
+        kw["prefetch_factor"] = max(2, int(prefetch_factor))
+    return kw
+
+
 def make_epoch_train_loader(
     dataset: Dataset,
     *,
@@ -271,18 +302,65 @@ def make_epoch_train_loader(
     seed: int,
     epoch: int,
     num_workers: int = 0,
+    pin_memory: Optional[bool] = None,
+    persistent_workers: Optional[bool] = None,
+    prefetch_factor: Optional[int] = None,
+    device: Optional[str] = None,
 ) -> DataLoader:
-    """Train loader with shuffle order fixed by ``(seed, epoch)``."""
+    """Train loader with shuffle order fixed by ``(seed, epoch)``.
+
+    Prefer :func:`make_reusable_train_loader` + :func:`reseed_train_loader` inside
+    the training loop so worker processes stay warm across epochs.
+    """
     g = torch.Generator()
     g.manual_seed(epoch_seed(seed, epoch))
     sampler = torch.utils.data.RandomSampler(dataset, generator=g)
-    return DataLoader(
+    kw = dataloader_kwargs(
+        num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor,
+        device=device,
+    )
+    loader = DataLoader(dataset, batch_size=batch_size, sampler=sampler, **kw)
+    loader._shuffle_generator = g  # type: ignore[attr-defined]
+    return loader
+
+
+def make_reusable_train_loader(
+    dataset: Dataset,
+    *,
+    batch_size: int,
+    seed: int,
+    num_workers: int = 0,
+    pin_memory: Optional[bool] = None,
+    persistent_workers: Optional[bool] = None,
+    prefetch_factor: Optional[int] = None,
+    device: Optional[str] = None,
+) -> DataLoader:
+    """One long-lived train loader; reseed with :func:`reseed_train_loader` each epoch."""
+    return make_epoch_train_loader(
         dataset,
         batch_size=batch_size,
-        sampler=sampler,
+        seed=seed,
+        epoch=0,
         num_workers=num_workers,
-        drop_last=False,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor,
+        device=device,
     )
+
+
+def reseed_train_loader(loader: DataLoader, seed: int, epoch: int) -> None:
+    """Reset the train shuffle generator for deterministic epoch ``e`` order."""
+    g = getattr(loader, "_shuffle_generator", None)
+    if g is None:
+        raise AttributeError(
+            "DataLoader has no _shuffle_generator; build it with make_epoch_train_loader "
+            "or make_reusable_train_loader."
+        )
+    g.manual_seed(epoch_seed(seed, epoch))
 
 
 def skip_batches(loader: DataLoader, n_skip: int) -> Iterator[Any]:
@@ -308,6 +386,10 @@ def build_dataloaders(
     splits_dir: str | Path = DEFAULT_SPLITS_DIR,
     split_seed: int = DEFAULT_SPLIT_SEED,
     include_test: bool = False,
+    pin_memory: Optional[bool] = None,
+    persistent_workers: Optional[bool] = None,
+    prefetch_factor: Optional[int] = None,
+    device: Optional[str] = None,
 ) -> Tuple[DataLoader, DataLoader] | Tuple[DataLoader, DataLoader, DataLoader, Dict[str, Any]]:
     """Create loaders from fixed split lists (independent of ``seed``).
 
@@ -362,19 +444,28 @@ def build_dataloaders(
         # Degenerate tiny synthetic: reuse a one-sample view of train for model selection.
         val_ds = train_ds
 
-    train_loader = make_epoch_train_loader(
+    dl_kw = dataloader_kwargs(
+        num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor,
+        device=device,
+    )
+    train_loader = make_reusable_train_loader(
         train_ds,
         batch_size=batch_size,
         seed=seed,
-        epoch=0,
         num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor,
+        device=device,
     )
     val_loader = DataLoader(
         val_ds,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=num_workers,
-        drop_last=False,
+        **dl_kw,
     )
     info = spec.as_meta()
     info["train_list"] = list(spec.train_paths)
@@ -401,8 +492,7 @@ def build_dataloaders(
         test_ds,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=num_workers,
-        drop_last=False,
+        **dl_kw,
     )
     if len(test_ds) < 5000 and dataset_name != "synthetic":
         print(
@@ -422,6 +512,10 @@ def build_test_loader(
     splits_dir: str | Path = DEFAULT_SPLITS_DIR,
     split_seed: int = DEFAULT_SPLIT_SEED,
     num_samples: Optional[int] = None,
+    pin_memory: Optional[bool] = None,
+    persistent_workers: Optional[bool] = None,
+    prefetch_factor: Optional[int] = None,
+    device: Optional[str] = None,
 ) -> Tuple[DataLoader, Dict[str, Any]]:
     """Inference-only loader over the fixed test split."""
     dataset_name = dataset_name.lower()
@@ -451,8 +545,13 @@ def build_test_loader(
         test_ds,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=num_workers,
-        drop_last=False,
+        **dataloader_kwargs(
+            num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=persistent_workers,
+            prefetch_factor=prefetch_factor,
+            device=device,
+        ),
     )
     info = spec.as_meta()
     info["train_list"] = list(spec.train_paths)

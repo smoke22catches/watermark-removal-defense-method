@@ -33,7 +33,7 @@ from src.attacks.sampler import (
     curriculum_probs,
     validate_curriculum_config,
 )
-from src.data.datasets import make_epoch_train_loader, skip_batches
+from src.data.datasets import make_reusable_train_loader, reseed_train_loader, skip_batches
 from src.engine.evaluate import evaluate_protocol
 from src.losses import PerceptualLoss, combined_loss
 from src.models import Decoder, Encoder
@@ -402,10 +402,23 @@ def train(
     use_lpips = bool(config.get("use_lpips", True))
     perc_loss = PerceptualLoss(use_lpips=use_lpips).to(device)
 
+    # Limit PyTorch intra-op CPU threads so they do not fight DataLoader workers.
+    # High htop %CPU on the main process is often OpenMP/MKL using all cores.
+    torch_threads = config.get("torch_num_threads")
+    if torch_threads is not None:
+        torch.set_num_threads(max(1, int(torch_threads)))
+    elif str(device).startswith("cuda"):
+        # Sensible default on GPU servers: leave headroom for image decode workers.
+        try:
+            torch.set_num_threads(min(4, max(1, torch.get_num_threads())))
+        except Exception:
+            pass
+
     epochs = int(config.get("epochs", 100))
     msg_len = int(config.get("msg_len", 64))
     val_every = int(config.get("val_every", 5))
     ckpt_every = int(config.get("ckpt_every_iters", 500))
+    log_every = int(config.get("log_every_iters", 50))
     use_amp = bool(config.get("amp", False)) and str(device).startswith("cuda")
     scaler = None
     if use_amp:
@@ -417,7 +430,28 @@ def train(
     interrupt_after_step = int(interrupt_after) if interrupt_after is not None else None
     batch_size = int(config.get("batch_size", getattr(dataloader, "batch_size", 4) or 4))
     num_workers = int(config.get("num_workers", 0))
+    pin_memory = config.get("pin_memory")
+    if pin_memory is None:
+        pin_memory = str(device).startswith("cuda")
+    prefetch_factor = config.get("prefetch_factor")
+    persistent_workers = config.get("persistent_workers")
     train_dataset = dataloader.dataset
+    # Prefer the caller's loader when it was built with make_*_train_loader so we
+    # do not spawn a second worker pool. Otherwise build one long-lived loader.
+    if hasattr(dataloader, "_shuffle_generator"):
+        train_loader = dataloader
+    else:
+        train_loader = make_reusable_train_loader(
+            train_dataset,
+            batch_size=batch_size,
+            seed=seed,
+            num_workers=num_workers,
+            pin_memory=bool(pin_memory),
+            persistent_workers=persistent_workers,
+            prefetch_factor=int(prefetch_factor) if prefetch_factor is not None else None,
+            device=device,
+        )
+    pin_memory_transfer = bool(getattr(train_loader, "pin_memory", False))
 
     sched_name = config.get("lr_scheduler", None)
     if sched_name == "cosine":
@@ -492,7 +526,9 @@ def train(
             f"guided_regen start_epoch={gh['guided_start_epoch']} "
             f"prob={gh['guided_prob']} eps={gh['eps_guided']} "
             f"beta={gh['beta_guided']} J={gh['J_guided']}; "
-            f"ckpt_every_iters={ckpt_every} amp={use_amp} config_hash={cfg_hash}"
+            f"ckpt_every_iters={ckpt_every} amp={use_amp} "
+            f"num_workers={num_workers} pin_memory={bool(pin_memory)} "
+            f"log_every_iters={log_every} config_hash={cfg_hash}"
         )
 
     def _save_ckpt(*, also_best: bool = False) -> None:
@@ -535,16 +571,10 @@ def train(
             set_rng_state(pending_rng)
             pending_rng = None
 
-        epoch_loader = make_epoch_train_loader(
-            train_dataset,
-            batch_size=batch_size,
-            seed=seed,
-            epoch=epoch,
-            num_workers=num_workers,
-        )
+        reseed_train_loader(train_loader, seed, epoch)
         if pending_rng is not None and n_skip > 0:
             # DataLoader.__iter__ advances the global RNG; skip first, then restore.
-            data_iter = iter(epoch_loader)
+            data_iter = iter(train_loader)
             for _ in range(n_skip):
                 try:
                     next(data_iter)
@@ -554,17 +584,18 @@ def train(
             pending_rng = None
             batch_iter = data_iter
         else:
-            batch_iter = skip_batches(epoch_loader, n_skip)
+            batch_iter = skip_batches(train_loader, n_skip)
 
         pbar = tqdm(
             batch_iter,
             desc=f"epoch {epoch + 1}/{epochs}",
             leave=False,
             initial=n_skip,
-            total=len(epoch_loader),
+            total=len(train_loader),
+            mininterval=1.0,
         )
         for batch in pbar:
-            x = batch[0].to(device)
+            x = batch[0].to(device, non_blocking=pin_memory_transfer)
             if latency_images is None:
                 latency_images = x.detach().cpu()
             text_embeds = make_text_embeds(
@@ -609,14 +640,15 @@ def train(
                 branch_counts[atk] += 1
             if stats.get("guided_applied"):
                 guided_regen_count += 1
-            pbar.set_postfix(
-                loss=stats["loss"],
-                atk=atk,
-                step=global_step,
-                guided=int(bool(stats.get("guided_applied"))),
-            )
+            if global_step % max(log_every, 1) == 0 or iter_in_epoch == 1:
+                pbar.set_postfix(
+                    loss=f"{stats['loss']:.4f}",
+                    atk=atk,
+                    step=global_step,
+                    guided=int(bool(stats.get("guided_applied"))),
+                )
 
-            if logger:
+            if logger and (global_step % max(log_every, 1) == 0 or iter_in_epoch == 1):
                 logger.log_metric_rows(
                     [
                         long_row(
@@ -645,6 +677,8 @@ def train(
                 _InterruptState.requested = True
 
             if _InterruptState.requested:
+                if logger:
+                    logger.flush_metrics()
                 _save_ckpt()
                 interrupted = True
                 if logger:
@@ -652,6 +686,9 @@ def train(
                         f"Interrupted after global_step={global_step}; checkpoint saved."
                     )
                 break
+
+        if logger:
+            logger.flush_metrics()
 
         if interrupted:
             break
