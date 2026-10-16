@@ -138,6 +138,15 @@ def evaluate_protocol(
             strengths = (float(grid[len(grid) // 2]),)
 
         for strength in strengths:
+            n_batches = len(val_loader)
+            # Heavy regen attacks can take many minutes per strength with no other
+            # output; announce start so the run does not look wedged after the
+            # previous attack's summary line (e.g. after rinse_2 → rinse_4).
+            print(
+                f"[eval] {spec.id} strength={strength}: "
+                f"starting ({n_batches} batches)...",
+                flush=True,
+            )
             fid = FIDMeter(device=device) if compute_fid and compute_quality else None
             bit_accs: List[float] = []
             pos_stats: List[float] = []
@@ -151,7 +160,16 @@ def evaluate_protocol(
             # Reset message RNG per (attack, strength) so every transform sees
             # the same cover→message pairing (fair across schemes).
             msg_gen.manual_seed(int(seed) + 17_389)
-            for batch in val_loader:
+            heavy = spec.id in (
+                "diffpure",
+                "rinse_2",
+                "rinse_4",
+                "regen_proxy",
+                "guided_regen",
+                "bmshj2018",
+                "cheng2020",
+            )
+            for batch_idx, batch in enumerate(val_loader):
                 x = batch[0].to(device)
                 m = sample_bits(x.size(0), k, device=device, generator=msg_gen)
                 with torch.no_grad():
@@ -203,6 +221,17 @@ def evaluate_protocol(
                             lpips_vals.extend(lpips_meter(x, x_test))
                         if fid is not None:
                             fid.update(x, x_test)
+
+                if heavy and (
+                    batch_idx == 0
+                    or (batch_idx + 1) % max(1, n_batches // 5) == 0
+                    or batch_idx + 1 == n_batches
+                ):
+                    print(
+                        f"[eval] {spec.id} strength={strength}: "
+                        f"batch {batch_idx + 1}/{n_batches}",
+                        flush=True,
+                    )
 
             def _mean(vals: List[float]) -> float:
                 return float(sum(vals) / len(vals)) if vals else float("nan")

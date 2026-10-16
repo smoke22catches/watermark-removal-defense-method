@@ -499,12 +499,37 @@ def train(
                 f"iter_in_epoch={iter_in_epoch} global_step={global_step}"
             )
 
-    eval_attacks = list(
-        config.get("eval", {}).get(
-            "attacks",
-            ["clean", "jpeg", "rotate", "crop", "noise", "unseen_blur", "diffpure", "adv"],
-        )
-    )
+    # Prefer a lightweight train-time subset. Full WAVES suite (rinse_4 = 4×50-step
+    # DiffPure, compressai downloads, …) belongs in scripts/infer.py, not every val.
+    eval_cfg = config.get("eval", {}) or {}
+    _default_val = [
+        "clean",
+        "jpeg",
+        "rotate",
+        "crop",
+        "noise",
+        "unseen_blur",
+        "regen_proxy",
+        "guided_regen",
+        "adv",
+    ]
+    _heavy_val = {"diffpure", "rinse_2", "rinse_4", "bmshj2018", "cheng2020"}
+    if eval_cfg.get("val_attacks") is not None:
+        eval_attacks = list(eval_cfg["val_attacks"])
+    else:
+        raw = list(eval_cfg.get("attacks") or _default_val)
+        # Legacy configs stuffed the full infer suite into eval.attacks; strip the
+        # multi-minute DiffPure/rinse/compressai passes unless val_attacks is set.
+        if any(a in _heavy_val for a in raw):
+            eval_attacks = [a for a in raw if a not in _heavy_val] or list(_default_val)
+            print(
+                "[train] train-time val omits heavy attacks "
+                f"{sorted(_heavy_val & set(raw))}; "
+                "use scripts/infer.py or set eval.val_attacks to override",
+                flush=True,
+            )
+        else:
+            eval_attacks = raw
 
     enc_params = count_parameters(encoder)
     dec_params = count_parameters(decoder)

@@ -233,20 +233,23 @@ class RegenerationProxy(nn.Module):
             if cond.size(0) == 1 and x_w.size(0) != 1:
                 cond = cond.expand(x_w.size(0), -1, -1)
 
-        latents = self.vae.encode(x_in).latent_dist.sample() * self.scaling_factor
-        t_idx = int(self.t_start * self.scheduler.config.num_train_timesteps)
-        noise = torch.randn_like(latents)
-        timesteps = torch.tensor([t_idx], device=x_w.device, dtype=torch.long)
-        noisy_latents = self.scheduler.add_noise(latents, noise, timesteps)
+        # Training needs grads through x_w; eval DiffPure/rinse must not force
+        # enable_grad() (a 50-step × rinse_4 chain looked wedged / blew memory).
+        step_ctx = torch.enable_grad() if x_w.requires_grad else torch.inference_mode()
+        with step_ctx:
+            latents = self.vae.encode(x_in).latent_dist.sample() * self.scaling_factor
+            t_idx = int(self.t_start * self.scheduler.config.num_train_timesteps)
+            noise = torch.randn_like(latents)
+            timesteps = torch.tensor([t_idx], device=x_w.device, dtype=torch.long)
+            noisy_latents = self.scheduler.add_noise(latents, noise, timesteps)
 
-        self.scheduler.set_timesteps(self.n_steps, device=x_w.device)
-        lat = noisy_latents
-        for t in self.scheduler.timesteps:
-            with torch.enable_grad():  # свідомо не no_grad — щоб градієнт міг протікати до E під час adv-тренування
+            self.scheduler.set_timesteps(self.n_steps, device=x_w.device)
+            lat = noisy_latents
+            for t in self.scheduler.timesteps:
                 noise_pred = self.unet(lat, t, encoder_hidden_states=cond).sample
                 lat = self.scheduler.step(noise_pred, t, lat).prev_sample
 
-        x_regen = self.vae.decode(lat / self.scaling_factor).sample
+            x_regen = self.vae.decode(lat / self.scaling_factor).sample
         return torch.clamp(x_regen.float(), -1.0, 1.0)
 
 

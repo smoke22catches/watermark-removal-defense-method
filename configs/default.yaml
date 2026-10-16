@@ -128,7 +128,12 @@ baselines:
 
 # --- evaluation (real transforms; never training DistortionBank approximations) ---
 eval:
+  # Full protocol for scripts/infer.py (includes heavy DiffPure / rinse / compressai).
   attacks: [clean, jpeg, rotate, crop, noise, unseen_blur, regen_proxy, guided_regen, diffpure, rinse_2, rinse_4, bmshj2018, cheng2020, adv]
+  # Train-time validation only (scripts/train.py). Omits rinse_*/diffpure/compressai —
+  # those can look "stuck" for a long time after the previous attack's log line
+  # (rinse_4 = 4 × diffpure_steps UNet passes per image, no intermediate summary).
+  val_attacks: [clean, jpeg, rotate, crop, noise, unseen_blur, regen_proxy, guided_regen, adv]
   # DiffPure / rinse use a DIFFERENT diffusion checkpoint than regen.sd_model_id.
   diffpure_model_id: CompVis/stable-diffusion-v1-4
   diffpure_steps: 50

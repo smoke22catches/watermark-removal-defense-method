@@ -111,11 +111,15 @@ def rinse(
     """Apply diffusion purification ``repeats`` times (WAVES Regen-2x / 4x)."""
     n = max(int(repeats), 1)
     y = x
-    for _ in range(n):
+    for i in range(n):
         if purifier is None:
             y = _offline_diffpure(y, n_steps=20, t_start=t_start)
         else:
             y = purifier(y, t_start=t_start)
+        # Detach between passes so rinse_4 cannot chain autograd across repeats.
+        y = y.detach()
+        if n >= 4 and (i == 0 or (i + 1) % 2 == 0):
+            print(f"[eval] rinse pass {i + 1}/{n} done", flush=True)
     return y.clamp(-1, 1)
 
 
@@ -141,10 +145,17 @@ def _load_compressai(model: str, quality: int, device: str):
     builder = builders.get(model)
     if builder is None:
         raise ValueError(f"Unknown compressai model key: {model}")
+    # pretrained=True may download weights; log so a network stall is not silent.
+    print(
+        f"[eval] loading compressai {model} quality={quality} "
+        f"(pretrained download if not cached)...",
+        flush=True,
+    )
     net = builder(quality=int(quality), pretrained=True).eval().to(device)
     for p in net.parameters():
         p.requires_grad_(False)
     _COMPRESSAI_CACHE[key] = net
+    print(f"[eval] compressai {model} q={quality} ready", flush=True)
     return net
 
 
