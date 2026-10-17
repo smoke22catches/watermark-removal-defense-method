@@ -27,6 +27,7 @@ from src.data.splits import (
     generate_synthetic_splits,
     list_file_hash,
     load_split_spec,
+    resolve_role_root,
 )
 
 
@@ -88,6 +89,22 @@ def main() -> None:
             coco_test_size=int(args.coco_test_size),
             synthetic_n=int(args.synthetic_n),
         )
+        # Surface skips so a fraction-capped COCO failure is not mistaken for success.
+        expected = {"coco", "div2k", "imagenette", "synthetic"}
+        missing = sorted(expected - set(specs))
+        if missing:
+            print(
+                f"\n[warn] skipped datasets (no usable images / split error): {missing}"
+            )
+            coco_present = (
+                resolve_role_root(data_root, "coco", "train") is not None
+                or resolve_role_root(data_root, "coco", "val") is not None
+            )
+            if "coco" in missing and coco_present:
+                raise SystemExit(
+                    "COCO images are present but splits were not generated. "
+                    "Check train2017/val2017 under data/coco/, then re-run make_splits."
+                )
     elif name == "coco":
         specs = {
             "coco": generate_coco_splits(

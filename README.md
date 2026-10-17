@@ -35,8 +35,9 @@ python scripts/download_data.py --dataset coco --num-samples 100
 python scripts/download_data.py --dataset imagenette --num-samples 200
 ```
 
-Writes `data/manifest.json` with paths and image counts. Training falls back to a
-synthetic dataset if the named set is missing.
+Writes `data/manifest.json` with paths and image counts. Training requires fixed
+splits under `data/splits/<dataset>/` for real datasets (run `make_splits.py`);
+use `--dataset synthetic` for an offline smoke set.
 
 ## Fixed train / val / test splits
 

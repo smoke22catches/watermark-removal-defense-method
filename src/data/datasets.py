@@ -408,17 +408,24 @@ def build_dataloaders(
             split_seed=split_seed,
             num_samples=num_samples,
         )
-    except FileNotFoundError:
-        print(
-            f"[data] No fixed splits for '{dataset_name}'; falling back to synthetic splits."
-        )
-        spec = generate_synthetic_splits(
-            Path(data_root),
-            Path(splits_dir),
-            split_seed=int(split_seed),
-            num_samples=int(num_samples) if num_samples is not None else 64,
-        )
-        dataset_name = "synthetic"
+    except FileNotFoundError as e:
+        # Never silently swap a real dataset for the tiny synthetic smoke set
+        # (64 images → ~3 train batches at batch_size=16). That masked missing
+        # COCO splits after fraction-capped downloads.
+        if dataset_name == "synthetic":
+            spec = generate_synthetic_splits(
+                Path(data_root),
+                Path(splits_dir),
+                split_seed=int(split_seed),
+                num_samples=int(num_samples) if num_samples is not None else 64,
+            )
+        else:
+            raise FileNotFoundError(
+                f"No fixed splits for '{dataset_name}' under {splits_dir}. "
+                f"Run: python scripts/download_data.py --dataset {dataset_name} "
+                f"&& python scripts/make_splits.py --dataset {dataset_name}. "
+                f"Refusing to fall back to synthetic ({e})"
+            ) from e
 
     train_ds, spec = build_split_dataset(
         dataset_name,

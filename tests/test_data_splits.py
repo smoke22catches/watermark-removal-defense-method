@@ -200,6 +200,50 @@ def test_coco_test_split_size_5000() -> None:
         assert meta["extra"]["val_from_train"] is True
 
 
+def test_coco_fraction_capped_val_clamps_test_size() -> None:
+    """download_data --fraction 0.6 leaves val2017 with 3000 images; splits must still work."""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        data_root = root / "data"
+        splits_dir = root / "splits"
+        capped_val = 3000  # int(5000 * 0.6)
+        capped_train = 2000
+        _make_coco_tree(data_root, n_train=capped_train, n_val=capped_val)
+        spec = generate_coco_splits(
+            data_root, splits_dir, split_seed=DEFAULT_SPLIT_SEED
+        )
+        assert len(spec.test_paths) == capped_val
+        assert len(spec.val_paths) == COCO_VAL_SIZE
+        assert len(spec.train_paths) == capped_train - COCO_VAL_SIZE
+        meta = json.loads((splits_dir / "coco" / "meta.json").read_text(encoding="utf-8"))
+        assert meta["extra"]["test_size"] == capped_val
+        assert meta["extra"]["requested_test_size"] == COCO_TEST_SIZE
+        assert meta["extra"]["val_from_train"] is True
+
+
+def test_missing_coco_splits_do_not_fallback_to_synthetic() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        data_root = root / "data"
+        splits_dir = root / "splits"
+        try:
+            build_dataloaders(
+                dataset_name="coco",
+                data_root=data_root,
+                image_size=32,
+                batch_size=4,
+                num_workers=0,
+                seed=0,
+                splits_dir=splits_dir,
+                split_seed=DEFAULT_SPLIT_SEED,
+            )
+            raised = False
+        except FileNotFoundError as e:
+            raised = True
+            assert "synthetic" in str(e).lower() or "make_splits" in str(e)
+        assert raised, "missing coco splits must not silently become synthetic"
+
+
 def test_coco_both_from_val_when_pool_large_enough() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -241,6 +285,10 @@ if __name__ == "__main__":
     print("[ok] infer same test list + overlap abort")
     test_coco_test_split_size_5000()
     print("[ok] coco test size 5000 (real val2017 layout)")
+    test_coco_fraction_capped_val_clamps_test_size()
+    print("[ok] coco fraction-capped val clamps test_size")
+    test_missing_coco_splits_do_not_fallback_to_synthetic()
+    print("[ok] missing coco splits do not fall back to synthetic")
     test_coco_both_from_val_when_pool_large_enough()
     print("[ok] coco both from val when pool large enough")
     test_write_list_file_deterministic_hash()

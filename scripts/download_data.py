@@ -474,6 +474,11 @@ def main() -> None:
     print("\nSummary:")
     for e in entries:
         print(f"  {e['name']}: {e.get('status')}  path={e.get('path')}  n={e.get('num_images')}")
+    if args.fraction is not None or args.num_samples is not None:
+        print(
+            "\nNote: capped downloads shrink COCO val2017 below the default "
+            "test_size=5000; make_splits.py clamps test_size to the images present."
+        )
     print(
         "\nNext: python scripts/make_splits.py --dataset all "
         "(writes data/splits/*/{{train,val,test}}.txt)"

@@ -218,34 +218,53 @@ def generate_coco_splits(
         train_pool = train_pool[: int(train_max)]
     val_pool = _shuffle(val_pool, split_seed + 1)
 
+    # Fractional / --num-samples downloads shrink val2017 below the paper default
+    # of 5,000. Clamp rather than skip COCO entirely (that used to make train.py
+    # silently fall back to a 46-image synthetic set ≈ 3 batches at BS=16).
+    effective_test_size = int(test_size)
+    effective_val_size = int(val_size)
+    if 0 < len(val_pool) < effective_test_size:
+        print(
+            f"[splits] coco: val2017 has {len(val_pool)} < requested "
+            f"test_size={effective_test_size}; clamping test_size to {len(val_pool)}"
+        )
+        effective_test_size = len(val_pool)
+
     val_from_train = False
-    if len(val_pool) >= val_size + test_size:
-        val_imgs = val_pool[:val_size]
-        test_imgs = val_pool[val_size : val_size + test_size]
+    if len(val_pool) >= effective_val_size + effective_test_size:
+        val_imgs = val_pool[:effective_val_size]
+        test_imgs = val_pool[effective_val_size : effective_val_size + effective_test_size]
         train_imgs = train_pool
         val_test_root = rel_posix(val_root, data_root)
     else:
-        if len(val_pool) < test_size:
+        if len(val_pool) < 1:
             raise RuntimeError(
-                f"COCO val2017 has {len(val_pool)} images; need at least "
-                f"test_size={test_size}. "
+                "COCO val2017 is empty; need images for the test split. "
                 "Run: python scripts/download_data.py --dataset coco"
             )
-        if len(train_pool) <= val_size:
-            raise RuntimeError(
-                f"COCO train2017 has {len(train_pool)} images after train_max; "
-                f"need > val_size={val_size} to hold out a validation split"
+        # Only when carving val from train may we need to shrink val_size.
+        if len(train_pool) <= effective_val_size:
+            if len(train_pool) < 2:
+                raise RuntimeError(
+                    f"COCO train2017 has {len(train_pool)} images after train_max; "
+                    f"need at least 2 to hold out a validation split"
+                )
+            new_val = max(1, len(train_pool) // 10)
+            print(
+                f"[splits] coco: train2017 has {len(train_pool)} <= requested "
+                f"val_size={effective_val_size}; clamping val_size to {new_val}"
             )
-        # Real COCO: full val2017 → test; carve val from train2017.
-        test_imgs = val_pool[:test_size]
-        val_imgs = train_pool[:val_size]
-        train_imgs = train_pool[val_size:]
+            effective_val_size = new_val
+        # Real COCO (or fraction-capped): val2017 → test; carve val from train2017.
+        test_imgs = val_pool[:effective_test_size]
+        val_imgs = train_pool[:effective_val_size]
+        train_imgs = train_pool[effective_val_size:]
         val_from_train = True
         val_test_root = rel_posix(val_root, data_root)
         print(
             f"[splits] coco: val2017 has {len(val_pool)} < val+test="
-            f"{val_size + test_size}; using val2017 for test ({len(test_imgs)}) "
-            f"and holding out val={len(val_imgs)} from train2017"
+            f"{effective_val_size + effective_test_size}; using val2017 for test "
+            f"({len(test_imgs)}) and holding out val={len(val_imgs)} from train2017"
         )
 
     return _write_dataset_splits(
@@ -265,9 +284,11 @@ def generate_coco_splits(
                 else rel_posix(val_root, data_root)
             ),
             "val_from_train": val_from_train,
-            "val_size": val_size,
-            "test_size": test_size,
+            "val_size": effective_val_size,
+            "test_size": effective_test_size,
             "train_max": train_max,
+            "requested_val_size": int(val_size),
+            "requested_test_size": int(test_size),
         },
     )
 
