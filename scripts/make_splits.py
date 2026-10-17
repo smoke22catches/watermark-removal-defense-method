@@ -96,11 +96,21 @@ def main() -> None:
             print(
                 f"\n[warn] skipped datasets (no usable images / split error): {missing}"
             )
-            coco_present = (
-                resolve_role_root(data_root, "coco", "train") is not None
-                or resolve_role_root(data_root, "coco", "val") is not None
-            )
-            if "coco" in missing and coco_present:
+            coco_train = resolve_role_root(data_root, "coco", "train")
+            coco_val = resolve_role_root(data_root, "coco", "val")
+            if "coco" in missing and (coco_train is not None or coco_val is not None):
+                if coco_train is None:
+                    raise SystemExit(
+                        "COCO val2017 is present but train2017 is missing or empty. "
+                        "A prior download left a corrupt train2017.zip — re-run:\n"
+                        "  python scripts/download_data.py --dataset coco --data-root ./data\n"
+                        "then re-run make_splits."
+                    )
+                if coco_val is None:
+                    raise SystemExit(
+                        "COCO train2017 is present but val2017 is missing or empty. "
+                        "Re-run: python scripts/download_data.py --dataset coco --data-root ./data"
+                    )
                 raise SystemExit(
                     "COCO images are present but splits were not generated. "
                     "Check train2017/val2017 under data/coco/, then re-run make_splits."

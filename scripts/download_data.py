@@ -43,6 +43,30 @@ def _sha256(path: Path, chunk: int = 1 << 20) -> str:
     return h.hexdigest()
 
 
+def _archive_looks_valid(path: Path) -> bool:
+    """Return True if ``path`` opens as a complete zip/tar (truncated downloads fail).
+
+    Incomplete HTTP downloads usually lack the end-of-central-directory record, so
+    ``ZipFile`` raises ``BadZipFile`` — that is the check that matters, not size.
+    """
+    if not path.is_file() or path.stat().st_size < 22:  # empty zip lower bound
+        return False
+    name = path.name.lower()
+    try:
+        if name.endswith(".zip"):
+            with zipfile.ZipFile(path, "r") as zf:
+                return bool(zf.namelist())
+        if (
+            name.endswith((".tgz", ".tar", ".tar.gz", ".tar.bz2", ".tar.xz"))
+            or ".tar" in name
+        ):
+            with tarfile.open(path, "r:*") as tf:
+                return bool(tf.getmembers())
+    except (zipfile.BadZipFile, tarfile.TarError, OSError, EOFError):
+        return False
+    return True
+
+
 def _download(url: str, dest: Path, expected_sha256: Optional[str] = None) -> Path:
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists() and expected_sha256:
@@ -53,8 +77,14 @@ def _download(url: str, dest: Path, expected_sha256: Optional[str] = None) -> Pa
         print(f"  [warn] checksum mismatch for {dest.name}; re-downloading")
         dest.unlink()
     elif dest.exists():
-        print(f"  [ok] cached {dest.name}")
-        return dest
+        if _archive_looks_valid(dest):
+            print(f"  [ok] cached {dest.name}")
+            return dest
+        print(
+            f"  [warn] corrupt/incomplete cache {dest.name} "
+            f"({dest.stat().st_size} bytes); re-downloading"
+        )
+        dest.unlink()
 
     print(f"  downloading {url}")
     print(f"         -> {dest}")
@@ -76,6 +106,13 @@ def _download(url: str, dest: Path, expected_sha256: Optional[str] = None) -> Pa
             dest.unlink()
         raise
 
+    if not _archive_looks_valid(dest):
+        size = dest.stat().st_size if dest.exists() else 0
+        dest.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"Downloaded archive {dest.name} is corrupt/incomplete ({size} bytes)"
+        )
+
     if expected_sha256:
         got = _sha256(dest)
         if got != expected_sha256:
@@ -90,18 +127,24 @@ def _download(url: str, dest: Path, expected_sha256: Optional[str] = None) -> Pa
 def _extract(archive: Path, out_dir: Path) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     print(f"  extracting {archive.name} -> {out_dir}")
-    if archive.suffix == ".zip" or archive.name.endswith(".zip"):
-        with zipfile.ZipFile(archive, "r") as zf:
-            zf.extractall(out_dir)
-    elif (
-        archive.suffix in {".tgz", ".gz", ".bz2", ".xz"}
-        or ".tar" in archive.name
-        or archive.name.endswith(".tgz")
-    ):
-        with tarfile.open(archive, "r:*") as tf:
-            tf.extractall(out_dir)
-    else:
-        raise ValueError(f"Unknown archive type: {archive}")
+    try:
+        if archive.suffix == ".zip" or archive.name.endswith(".zip"):
+            with zipfile.ZipFile(archive, "r") as zf:
+                zf.extractall(out_dir)
+        elif (
+            archive.suffix in {".tgz", ".gz", ".bz2", ".xz"}
+            or ".tar" in archive.name
+            or archive.name.endswith(".tgz")
+        ):
+            with tarfile.open(archive, "r:*") as tf:
+                tf.extractall(out_dir)
+        else:
+            raise ValueError(f"Unknown archive type: {archive}")
+    except Exception:
+        # Leave a broken archive on disk → next run would "cache" it forever.
+        print(f"  [warn] extract failed; removing corrupt archive {archive}")
+        archive.unlink(missing_ok=True)
+        raise
 
 
 def _cap_images(
@@ -430,6 +473,8 @@ def main() -> None:
             jobs = [{}]
 
         role_paths: Dict[str, str] = {}
+        role_counts: Dict[str, int] = {}
+        role_status: Dict[str, str] = {}
         last_entry: Dict[str, Any] = {
             "name": name,
             "path": str(data_root / name),
@@ -449,9 +494,12 @@ def main() -> None:
                 split_name = str(entry.get("split") or job.get("split") or "")
                 if split_name:
                     role_paths[split_name] = str(entry.get("path", ""))
+                    role_counts[split_name] = int(entry.get("num_images") or 0)
+                    role_status[split_name] = str(entry.get("status") or "error")
                 print(f"  role={split_name or 'default'}: {entry.get('status')} n={entry.get('num_images')}")
             except Exception as e:
                 print(f"[{name}] error (continuing): {e}")
+                split_name = str(job.get("split") or "")
                 last_entry = {
                     "name": name,
                     "path": str(data_root / name),
@@ -460,14 +508,27 @@ def main() -> None:
                     "status": "error",
                     "error": str(e),
                 }
+                if split_name:
+                    role_paths[split_name] = str(data_root / name / split_name)
+                    role_counts[split_name] = 0
+                    role_status[split_name] = "error"
         # Prefer train path as the primary manifest path; keep all roles.
         if "train2017" in role_paths:
             last_entry["path"] = role_paths["train2017"]
             last_entry["path_val"] = role_paths.get("val2017", "")
+            last_entry["num_images"] = role_counts.get("train2017", 0)
         elif "train" in role_paths:
             last_entry["path"] = role_paths["train"]
             last_entry["path_val"] = role_paths.get("val") or role_paths.get("valid", "")
+            last_entry["num_images"] = role_counts.get("train", 0)
         last_entry["paths"] = role_paths
+        last_entry["role_counts"] = role_counts
+        # Require every downloaded role to have images; do not mark ok if train failed.
+        if role_status and any(
+            role_counts.get(r, 0) <= 0 or role_status.get(r) not in ("ok", "cached")
+            for r in role_status
+        ):
+            last_entry["status"] = "incomplete"
         entries.append(last_entry)
 
     write_manifest(data_root, entries)

@@ -1,7 +1,7 @@
 {
   "counts": {
-    "test": 100,
-    "train": 750,
+    "test": 30,
+    "train": 190,
     "val": 50
   },
   "data_root": "data",
@@ -12,9 +12,9 @@
     "val_size": 50
   },
   "split_hashes": {
-    "test.txt": "6255d6f563b1b45024ba6be2ac0f16fcb80c6ad9d2e28ca3c4b75fa396998945",
-    "train.txt": "b7062d80e7c6727c562c1b9a49b29885220e00d0f4040abda37f7050a240908b",
-    "val.txt": "5bb4d1a30b1550dee4785560f6f50e5f501aa93cec3219270d1483ff31ea840a"
+    "test.txt": "5bab8793fb05efe058e96fc72cc2565501075abfdf1f3cefd3edbea8c800dc08",
+    "train.txt": "e3d04945a5b359efd04c3fca838d03f007f9c60a68bd342e012e51a69ffe8587",
+    "val.txt": "cb7fba1e9358b6e630fdc764b7be78ae7601e33e268f4f23e0c5f21a41f1e435"
   },
   "split_seed": 20241010
 }
