@@ -104,19 +104,38 @@ def _extract(archive: Path, out_dir: Path) -> None:
         raise ValueError(f"Unknown archive type: {archive}")
 
 
-def _cap_images(root: Path, num_samples: Optional[int]) -> int:
-    """Optionally keep only the first ``num_samples`` images (sorted) for quick tests."""
+def _cap_images(
+    root: Path,
+    num_samples: Optional[int] = None,
+    fraction: Optional[float] = None,
+) -> int:
+    """Optionally keep a subset of images (sorted) for quick tests.
+
+    ``fraction`` is in ``[0, 1]`` and keeps that share of the dataset.
+    When both ``fraction`` and ``num_samples`` are set, the stricter (smaller) cap wins.
+    """
     files = sorted(p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in IMAGE_EXTS)
-    if num_samples is None or num_samples >= len(files):
-        return len(files)
-    keep = set(files[:num_samples])
+    n = len(files)
+    limit = n
+    if fraction is not None:
+        if not 0.0 <= fraction <= 1.0:
+            raise ValueError(f"fraction must be in [0, 1], got {fraction}")
+        limit = min(limit, int(n * fraction))
+    if num_samples is not None:
+        limit = min(limit, num_samples)
+    if limit >= n:
+        return n
+    keep = set(files[:limit])
     removed = 0
     for p in files:
         if p not in keep:
             p.unlink()
             removed += 1
-    print(f"  capped to {num_samples} images (removed {removed})")
-    return num_samples
+    label = f"{limit} images"
+    if fraction is not None:
+        label += f" ({fraction:.0%} of {n})"
+    print(f"  capped to {label} (removed {removed})")
+    return limit
 
 
 # ---------------------------------------------------------------------------
@@ -127,12 +146,13 @@ def download_coco(
     data_root: Path,
     split: str = "val2017",
     num_samples: Optional[int] = None,
+    fraction: Optional[float] = None,
 ) -> Dict[str, Any]:
     """MS-COCO images (val2017 by default; val2014 also supported)."""
     split = split if split in ("val2017", "val2014", "train2017", "train2014") else "val2017"
     out = data_root / "coco" / split
     if out.exists() and _count_images(out) > 0:
-        n = _cap_images(out, num_samples)
+        n = _cap_images(out, num_samples, fraction)
         print(f"COCO {split}: already present at {out} ({n} images)")
         return {"name": "coco", "path": str(out), "split": split, "num_images": n, "status": "cached"}
 
@@ -148,7 +168,7 @@ def download_coco(
         print(f"  Place images under {out}")
         return {"name": "coco", "path": str(out), "split": split, "num_images": 0, "status": "manual_required"}
 
-    n = _cap_images(out, num_samples)
+    n = _cap_images(out, num_samples, fraction)
     print(f"COCO {split}: {out} ({n} images)")
     return {"name": "coco", "path": str(out), "split": split, "num_images": n, "status": "ok"}
 
@@ -157,13 +177,14 @@ def download_div2k(
     data_root: Path,
     split: str = "valid",
     num_samples: Optional[int] = None,
+    fraction: Optional[float] = None,
 ) -> Dict[str, Any]:
     """DIV2K high-resolution images (train or valid HR)."""
     split = "valid" if split in ("val", "valid", "validation") else "train"
     name = "DIV2K_valid_HR" if split == "valid" else "DIV2K_train_HR"
     out = data_root / "div2k" / name
     if out.exists() and _count_images(out) > 0:
-        n = _cap_images(out, num_samples)
+        n = _cap_images(out, num_samples, fraction)
         print(f"DIV2K {name}: already present at {out} ({n} images)")
         return {"name": "div2k", "path": str(out), "split": split, "num_images": n, "status": "cached"}
 
@@ -179,7 +200,7 @@ def download_div2k(
         print(f"  Extract so images land in {out}")
         return {"name": "div2k", "path": str(out), "split": split, "num_images": 0, "status": "manual_required"}
 
-    n = _cap_images(out, num_samples)
+    n = _cap_images(out, num_samples, fraction)
     print(f"DIV2K {name}: {out} ({n} images)")
     return {"name": "div2k", "path": str(out), "split": split, "num_images": n, "status": "ok"}
 
@@ -188,6 +209,7 @@ def download_imagenette(
     data_root: Path,
     split: str = "val",
     num_samples: Optional[int] = None,
+    fraction: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Imagenette (fast.ai) — ImageNet-style subset practical to auto-download."""
     out_root = data_root / "imagenette"
@@ -195,7 +217,7 @@ def download_imagenette(
     val_dir = extracted / "val"
     if val_dir.exists() and _count_images(val_dir) > 0:
         target = val_dir if split in ("val", "valid") else extracted / "train"
-        n = _cap_images(target, num_samples)
+        n = _cap_images(target, num_samples, fraction)
         print(f"Imagenette: already present at {target} ({n} images)")
         return {
             "name": "imagenette",
@@ -225,7 +247,7 @@ def download_imagenette(
         }
 
     target = val_dir if split in ("val", "valid") else extracted / "train"
-    n = _cap_images(target, num_samples)
+    n = _cap_images(target, num_samples, fraction)
     print(f"Imagenette: {target} ({n} images)")
     return {
         "name": "imagenette",
@@ -240,12 +262,13 @@ def download_imagenet(
     data_root: Path,
     split: str = "val",
     num_samples: Optional[int] = None,
+    fraction: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Full ImageNet requires registration — print instructions, do not hard-fail."""
     out = data_root / "imagenet" / ("val" if split in ("val", "valid") else "train")
     n = _count_images(out)
     if n > 0:
-        n = _cap_images(out, num_samples)
+        n = _cap_images(out, num_samples, fraction)
         print(f"ImageNet: found local copy at {out} ({n} images)")
         return {"name": "imagenet", "path": str(out), "split": split, "num_images": n, "status": "cached"}
 
@@ -268,12 +291,13 @@ def download_clic(
     data_root: Path,
     split: str = "professional",
     num_samples: Optional[int] = None,
+    fraction: Optional[float] = None,
 ) -> Dict[str, Any]:
     """CLIC professional/mobile test sets (learned compression + watermarking)."""
     split = split if split in ("professional", "mobile") else "professional"
     out = data_root / "clic" / split
     if out.exists() and _count_images(out) > 0:
-        n = _cap_images(out, num_samples)
+        n = _cap_images(out, num_samples, fraction)
         print(f"CLIC {split}: already present at {out} ({n} images)")
         return {"name": "clic", "path": str(out), "split": split, "num_images": n, "status": "cached"}
 
@@ -315,7 +339,7 @@ def download_clic(
             "status": "manual_required",
         }
 
-    n = _cap_images(out, num_samples)
+    n = _cap_images(out, num_samples, fraction)
     print(f"CLIC {split}: {out} ({n} images)")
     return {"name": "clic", "path": str(out), "split": split, "num_images": n, "status": "ok"}
 
@@ -346,6 +370,13 @@ def write_manifest(data_root: Path, entries: List[Dict[str, Any]]) -> Path:
     return path
 
 
+def _parse_fraction(value: str) -> float:
+    f = float(value)
+    if not 0.0 <= f <= 1.0:
+        raise argparse.ArgumentTypeError(f"fraction must be in [0, 1], got {f}")
+    return f
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Download watermarking benchmark datasets")
     p.add_argument(
@@ -356,7 +387,13 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--data-root", type=str, default="./data")
     p.add_argument("--split", type=str, default=None, help="Dataset-specific split")
-    p.add_argument("--num-samples", type=int, default=None, help="Optional image cap")
+    p.add_argument("--num-samples", type=int, default=None, help="Optional absolute image cap")
+    p.add_argument(
+        "--fraction",
+        type=_parse_fraction,
+        default=None,
+        help="Keep only this fraction of each dataset after extract (0-1, e.g. 0.1 = 10%%)",
+    )
     return p.parse_args()
 
 
@@ -403,6 +440,7 @@ def main() -> None:
             kwargs: Dict[str, Any] = {
                 "data_root": data_root,
                 "num_samples": args.num_samples,
+                "fraction": args.fraction,
                 **job,
             }
             try:
