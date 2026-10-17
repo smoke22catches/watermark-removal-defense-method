@@ -184,6 +184,10 @@ def _shuffle(paths: List[str], split_seed: int) -> List[str]:
     return out
 
 
+class InsufficientTestSplitError(RuntimeError):
+    """Raised when the produced test split is smaller than requested."""
+
+
 def generate_coco_splits(
     data_root: Path,
     splits_root: Path,
@@ -192,6 +196,7 @@ def generate_coco_splits(
     train_max: Optional[int] = None,
     val_size: int = COCO_VAL_SIZE,
     test_size: int = COCO_TEST_SIZE,
+    allow_small_test: bool = False,
 ) -> SplitSpec:
     """Build COCO train/val/test lists.
 
@@ -203,6 +208,10 @@ def generate_coco_splits(
     * Otherwise (real COCO): use ``val2017`` for **test** only, and hold out
       ``val_size`` images from ``train2017`` for validation (same pattern as DIV2K /
       Imagenette). Train and test remain in different folders.
+
+    If the resulting test split would be smaller than ``test_size``, raise
+    ``InsufficientTestSplitError`` unless ``allow_small_test`` is True (then clamp
+    and record the flag in meta.json).
     """
     train_root = resolve_role_root(data_root, "coco", "train")
     val_root = resolve_role_root(data_root, "coco", "val")
@@ -218,15 +227,21 @@ def generate_coco_splits(
         train_pool = train_pool[: int(train_max)]
     val_pool = _shuffle(val_pool, split_seed + 1)
 
-    # Fractional / --num-samples downloads shrink val2017 below the paper default
-    # of 5,000. Clamp rather than skip COCO entirely (that used to make train.py
-    # silently fall back to a 46-image synthetic set ≈ 3 batches at BS=16).
     effective_test_size = int(test_size)
     effective_val_size = int(val_size)
     if 0 < len(val_pool) < effective_test_size:
+        if not allow_small_test:
+            raise InsufficientTestSplitError(
+                f"COCO test split would have {len(val_pool)} images but "
+                f"requested_test_size={effective_test_size}. Likely cause: a capped "
+                f"evaluation folder (e.g. download_data.py --fraction applied to "
+                f"val2017). Re-download val2017 without --cap-eval-splits, or pass "
+                f"--allow-small-test to proceed intentionally."
+            )
         print(
             f"[splits] coco: val2017 has {len(val_pool)} < requested "
-            f"test_size={effective_test_size}; clamping test_size to {len(val_pool)}"
+            f"test_size={effective_test_size}; clamping test_size to {len(val_pool)} "
+            f"(--allow-small-test)"
         )
         effective_test_size = len(val_pool)
 
@@ -255,7 +270,7 @@ def generate_coco_splits(
                 f"val_size={effective_val_size}; clamping val_size to {new_val}"
             )
             effective_val_size = new_val
-        # Real COCO (or fraction-capped): val2017 → test; carve val from train2017.
+        # Real COCO: val2017 → test; carve val from train2017.
         test_imgs = val_pool[:effective_test_size]
         val_imgs = train_pool[:effective_val_size]
         train_imgs = train_pool[effective_val_size:]
@@ -267,6 +282,32 @@ def generate_coco_splits(
             f"({len(test_imgs)}) and holding out val={len(val_imgs)} from train2017"
         )
 
+    if len(test_imgs) < int(test_size) and not allow_small_test:
+        raise InsufficientTestSplitError(
+            f"COCO test split has {len(test_imgs)} images but "
+            f"requested_test_size={int(test_size)}. Likely cause: a capped "
+            f"evaluation folder. Re-download without --cap-eval-splits, or pass "
+            f"--allow-small-test."
+        )
+
+    extra: Dict[str, Any] = {
+        "train_root": rel_posix(train_root, data_root),
+        "val_test_root": val_test_root,
+        "val_root": (
+            rel_posix(train_root, data_root)
+            if val_from_train
+            else rel_posix(val_root, data_root)
+        ),
+        "val_from_train": val_from_train,
+        "val_size": effective_val_size,
+        "test_size": len(test_imgs),
+        "train_max": train_max,
+        "requested_val_size": int(val_size),
+        "requested_test_size": int(test_size),
+    }
+    if allow_small_test:
+        extra["allow_small_test"] = True
+
     return _write_dataset_splits(
         "coco",
         data_root,
@@ -275,21 +316,7 @@ def generate_coco_splits(
         val_imgs,
         test_imgs,
         split_seed=split_seed,
-        extra_meta={
-            "train_root": rel_posix(train_root, data_root),
-            "val_test_root": val_test_root,
-            "val_root": (
-                rel_posix(train_root, data_root)
-                if val_from_train
-                else rel_posix(val_root, data_root)
-            ),
-            "val_from_train": val_from_train,
-            "val_size": effective_val_size,
-            "test_size": effective_test_size,
-            "train_max": train_max,
-            "requested_val_size": int(val_size),
-            "requested_test_size": int(test_size),
-        },
+        extra_meta=extra,
     )
 
 
@@ -640,8 +667,13 @@ def generate_all_available(
     coco_val_size: int = COCO_VAL_SIZE,
     coco_test_size: int = COCO_TEST_SIZE,
     synthetic_n: int = 64,
+    allow_small_test: bool = False,
 ) -> Dict[str, SplitSpec]:
-    """Generate splits for each available dataset (skips missing sources)."""
+    """Generate splits for each available dataset (skips missing sources).
+
+    ``InsufficientTestSplitError`` is not swallowed — callers must handle or
+    pass ``allow_small_test=True``.
+    """
     data_root = Path(data_root)
     splits_dir = Path(splits_dir)
     wanted = [d.lower() for d in (datasets or ("coco", "div2k", "imagenette", "synthetic"))]
@@ -656,6 +688,7 @@ def generate_all_available(
                     train_max=coco_train_max,
                     val_size=coco_val_size,
                     test_size=coco_test_size,
+                    allow_small_test=allow_small_test,
                 )
             elif name == "div2k":
                 out[name] = generate_div2k_splits(
@@ -671,6 +704,8 @@ def generate_all_available(
                 )
             else:
                 print(f"[splits] skip unknown dataset {name}")
+        except InsufficientTestSplitError:
+            raise
         except (FileNotFoundError, RuntimeError) as e:
             print(f"[splits] skip {name}: {e}")
     return out

@@ -20,6 +20,7 @@ from src.data.splits import (
     DEFAULT_SPLITS_DIR,
     COCO_TEST_SIZE,
     COCO_VAL_SIZE,
+    InsufficientTestSplitError,
     generate_all_available,
     generate_coco_splits,
     generate_div2k_splits,
@@ -46,6 +47,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--coco-val-size", type=int, default=COCO_VAL_SIZE)
     p.add_argument("--coco-test-size", type=int, default=COCO_TEST_SIZE)
     p.add_argument("--synthetic-n", type=int, default=64)
+    p.add_argument(
+        "--allow-small-test",
+        action="store_true",
+        help=(
+            "Allow a COCO test split smaller than --coco-test-size (e.g. after a "
+            "capped val2017 download). Records allow_small_test=true in meta.json."
+        ),
+    )
     p.add_argument(
         "--verify",
         action="store_true",
@@ -79,83 +88,89 @@ def main() -> None:
                 print(f"  {fn}: {h[:16]}… [{ok}]")
         return
 
-    if name == "all":
-        specs = generate_all_available(
-            data_root,
-            splits_dir,
-            split_seed=int(args.split_seed),
-            coco_train_max=args.coco_train_max,
-            coco_val_size=int(args.coco_val_size),
-            coco_test_size=int(args.coco_test_size),
-            synthetic_n=int(args.synthetic_n),
-        )
-        # Surface skips so a fraction-capped COCO failure is not mistaken for success.
-        expected = {"coco", "div2k", "imagenette", "synthetic"}
-        missing = sorted(expected - set(specs))
-        if missing:
-            print(
-                f"\n[warn] skipped datasets (no usable images / split error): {missing}"
+    try:
+        if name == "all":
+            specs = generate_all_available(
+                data_root,
+                splits_dir,
+                split_seed=int(args.split_seed),
+                coco_train_max=args.coco_train_max,
+                coco_val_size=int(args.coco_val_size),
+                coco_test_size=int(args.coco_test_size),
+                synthetic_n=int(args.synthetic_n),
+                allow_small_test=bool(args.allow_small_test),
             )
-            coco_train = resolve_role_root(data_root, "coco", "train")
-            coco_val = resolve_role_root(data_root, "coco", "val")
-            if "coco" in missing and (coco_train is not None or coco_val is not None):
-                if coco_train is None:
-                    raise SystemExit(
-                        "COCO val2017 is present but train2017 is missing or empty. "
-                        "A prior download left a corrupt train2017.zip — re-run:\n"
-                        "  python scripts/download_data.py --dataset coco --data-root ./data\n"
-                        "then re-run make_splits."
-                    )
-                if coco_val is None:
-                    raise SystemExit(
-                        "COCO train2017 is present but val2017 is missing or empty. "
-                        "Re-run: python scripts/download_data.py --dataset coco --data-root ./data"
-                    )
-                raise SystemExit(
-                    "COCO images are present but splits were not generated. "
-                    "Check train2017/val2017 under data/coco/, then re-run make_splits."
+            # Surface skips so a fraction-capped COCO failure is not mistaken for success.
+            expected = {"coco", "div2k", "imagenette", "synthetic"}
+            missing = sorted(expected - set(specs))
+            if missing:
+                print(
+                    f"\n[warn] skipped datasets (no usable images / split error): {missing}"
                 )
-    elif name == "coco":
-        specs = {
-            "coco": generate_coco_splits(
-                data_root,
-                splits_dir,
-                split_seed=int(args.split_seed),
-                train_max=args.coco_train_max,
-                val_size=int(args.coco_val_size),
-                test_size=int(args.coco_test_size),
-            )
-        }
-    elif name == "div2k":
-        specs = {
-            "div2k": generate_div2k_splits(
-                data_root, splits_dir, split_seed=int(args.split_seed)
-            )
-        }
-    elif name == "imagenette":
-        specs = {
-            "imagenette": generate_imagenette_splits(
-                data_root, splits_dir, split_seed=int(args.split_seed)
-            )
-        }
-    elif name == "synthetic":
-        specs = {
-            "synthetic": generate_synthetic_splits(
-                data_root,
-                splits_dir,
-                split_seed=int(args.split_seed),
-                num_samples=int(args.synthetic_n),
-            )
-        }
-    else:
-        raise SystemExit(f"Unknown dataset: {name}")
+                coco_train = resolve_role_root(data_root, "coco", "train")
+                coco_val = resolve_role_root(data_root, "coco", "val")
+                if "coco" in missing and (coco_train is not None or coco_val is not None):
+                    if coco_train is None:
+                        raise SystemExit(
+                            "COCO val2017 is present but train2017 is missing or empty. "
+                            "A prior download left a corrupt train2017.zip — re-run:\n"
+                            "  python scripts/download_data.py --dataset coco --data-root ./data\n"
+                            "then re-run make_splits."
+                        )
+                    if coco_val is None:
+                        raise SystemExit(
+                            "COCO train2017 is present but val2017 is missing or empty. "
+                            "Re-run: python scripts/download_data.py --dataset coco --data-root ./data"
+                        )
+                    raise SystemExit(
+                        "COCO images are present but splits were not generated. "
+                        "Check train2017/val2017 under data/coco/, then re-run make_splits."
+                    )
+        elif name == "coco":
+            specs = {
+                "coco": generate_coco_splits(
+                    data_root,
+                    splits_dir,
+                    split_seed=int(args.split_seed),
+                    train_max=args.coco_train_max,
+                    val_size=int(args.coco_val_size),
+                    test_size=int(args.coco_test_size),
+                    allow_small_test=bool(args.allow_small_test),
+                )
+            }
+        elif name == "div2k":
+            specs = {
+                "div2k": generate_div2k_splits(
+                    data_root, splits_dir, split_seed=int(args.split_seed)
+                )
+            }
+        elif name == "imagenette":
+            specs = {
+                "imagenette": generate_imagenette_splits(
+                    data_root, splits_dir, split_seed=int(args.split_seed)
+                )
+            }
+        elif name == "synthetic":
+            specs = {
+                "synthetic": generate_synthetic_splits(
+                    data_root,
+                    splits_dir,
+                    split_seed=int(args.split_seed),
+                    num_samples=int(args.synthetic_n),
+                )
+            }
+        else:
+            raise SystemExit(f"Unknown dataset: {name}")
+    except InsufficientTestSplitError as e:
+        raise SystemExit(str(e)) from e
 
-    print("\nGenerated splits:")
+    print("\nFinal train/val/test counts:")
     for n, spec in specs.items():
         meta = spec.as_meta()
+        c = meta["counts"]
         print(
-            f"  {n}: train={meta['counts']['train']} val={meta['counts']['val']} "
-            f"test={meta['counts']['test']}  hashes={meta['split_hashes']}"
+            f"  {n}: train={c['train']} val={c['val']} test={c['test']}  "
+            f"hashes={meta['split_hashes']}"
         )
 
 

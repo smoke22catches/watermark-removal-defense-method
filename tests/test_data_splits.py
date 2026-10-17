@@ -16,6 +16,7 @@ from src.data.splits import (
     COCO_TEST_SIZE,
     COCO_VAL_SIZE,
     DEFAULT_SPLIT_SEED,
+    InsufficientTestSplitError,
     assert_train_test_disjoint,
     generate_coco_splits,
     generate_synthetic_splits,
@@ -200,17 +201,31 @@ def test_coco_test_split_size_5000() -> None:
         assert meta["extra"]["val_from_train"] is True
 
 
-def test_coco_fraction_capped_val_clamps_test_size() -> None:
-    """download_data --fraction 0.6 leaves val2017 with 3000 images; splits must still work."""
+def test_coco_small_val_refuses_without_allow_small_test() -> None:
+    """A capped val2017 must fail make_splits unless --allow-small-test is set."""
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         data_root = root / "data"
         splits_dir = root / "splits"
-        capped_val = 3000  # int(5000 * 0.6)
+        capped_val = 1500
         capped_train = 2000
         _make_coco_tree(data_root, n_train=capped_train, n_val=capped_val)
+        try:
+            generate_coco_splits(data_root, splits_dir, split_seed=DEFAULT_SPLIT_SEED)
+            raised = False
+        except InsufficientTestSplitError as e:
+            raised = True
+            msg = str(e)
+            assert "1500" in msg
+            assert str(COCO_TEST_SIZE) in msg
+            assert "capped" in msg.lower() or "allow-small-test" in msg.lower()
+        assert raised, "small val2017 must refuse without allow_small_test"
+
         spec = generate_coco_splits(
-            data_root, splits_dir, split_seed=DEFAULT_SPLIT_SEED
+            data_root,
+            splits_dir,
+            split_seed=DEFAULT_SPLIT_SEED,
+            allow_small_test=True,
         )
         assert len(spec.test_paths) == capped_val
         assert len(spec.val_paths) == COCO_VAL_SIZE
@@ -218,6 +233,7 @@ def test_coco_fraction_capped_val_clamps_test_size() -> None:
         meta = json.loads((splits_dir / "coco" / "meta.json").read_text(encoding="utf-8"))
         assert meta["extra"]["test_size"] == capped_val
         assert meta["extra"]["requested_test_size"] == COCO_TEST_SIZE
+        assert meta["extra"]["allow_small_test"] is True
         assert meta["extra"]["val_from_train"] is True
 
 
@@ -285,8 +301,8 @@ if __name__ == "__main__":
     print("[ok] infer same test list + overlap abort")
     test_coco_test_split_size_5000()
     print("[ok] coco test size 5000 (real val2017 layout)")
-    test_coco_fraction_capped_val_clamps_test_size()
-    print("[ok] coco fraction-capped val clamps test_size")
+    test_coco_small_val_refuses_without_allow_small_test()
+    print("[ok] coco small val refuses without --allow-small-test")
     test_missing_coco_splits_do_not_fallback_to_synthetic()
     print("[ok] missing coco splits do not fall back to synthetic")
     test_coco_both_from_val_when_pool_large_enough()

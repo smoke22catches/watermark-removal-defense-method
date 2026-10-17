@@ -15,7 +15,7 @@ data/*
 *.ckpt
 
 # Training / evaluation run artifacts
-runs/*/
+runs*/*/
 !runs/README.md
 
 # Python
