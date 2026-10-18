@@ -243,6 +243,7 @@ class RegenerationProxy(nn.Module):
             timesteps = torch.tensor([t_idx], device=x_w.device, dtype=torch.long)
             noisy_latents = self.scheduler.add_noise(latents, noise, timesteps)
 
+            # Always reset the schedule — scheduler.step mutates internal counters.
             self.scheduler.set_timesteps(self.n_steps, device=x_w.device)
             lat = noisy_latents
             for t in self.scheduler.timesteps:

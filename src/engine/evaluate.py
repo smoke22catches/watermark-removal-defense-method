@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+import time
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -29,6 +30,150 @@ from src.utils.metrics import (
     psnr_batch,
     ssim_batch,
 )
+
+# Attacks whose cost is dominated by multi-step diffusion / codecs.
+_HEAVY_ATTACKS = frozenset(
+    {
+        "diffpure",
+        "rinse_2",
+        "rinse_4",
+        "regen_proxy",
+        "guided_regen",
+        "bmshj2018",
+        "cheng2020",
+    }
+)
+
+
+def configure_eval_cuda() -> None:
+    """Enable TF32 / cuDNN autotune for eval (safe; does not change numerics materially)."""
+    if not torch.cuda.is_available():
+        return
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+
+
+def estimate_eval_workload(
+    attacks: Sequence[str],
+    *,
+    n_batches: int,
+    batch_size: int,
+    sweep_strengths: bool,
+    config: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Rough UNet-step / combo counts so long infer runs are explained up front."""
+    config = config or {}
+    eval_cfg = config.get("eval") or {}
+    regen_cfg = config.get("regen") or {}
+    diffpure_steps = int(eval_cfg.get("diffpure_steps", 50))
+    regen_steps = int(regen_cfg.get("n_steps", 4))
+    n_images = int(n_batches) * int(batch_size)
+    combos = 0
+    unet_steps = 0
+    heavy_combos = 0
+    for attack_id in attacks:
+        try:
+            spec = get_attack("unseen_blur" if attack_id == "unseen" else attack_id)
+        except KeyError:
+            continue
+        if spec.not_evaluated:
+            continue
+        grid = resolve_strengths(spec, config)
+        strengths = list(grid) if sweep_strengths else [float(grid[len(grid) // 2])]
+        combos += len(strengths)
+        if spec.id in _HEAVY_ATTACKS:
+            heavy_combos += len(strengths)
+        for _ in strengths:
+            if spec.id == "diffpure":
+                unet_steps += n_batches * diffpure_steps
+            elif spec.id == "rinse_2":
+                unet_steps += n_batches * 2 * diffpure_steps
+            elif spec.id == "rinse_4":
+                unet_steps += n_batches * 4 * diffpure_steps
+            elif spec.id in ("regen_proxy", "guided_regen"):
+                unet_steps += n_batches * regen_steps
+    return {
+        "n_batches": int(n_batches),
+        "batch_size": int(batch_size),
+        "n_images_approx": n_images,
+        "attack_strength_combos": combos,
+        "heavy_combos": heavy_combos,
+        "approx_diffusion_unet_forwards": int(unet_steps),
+        "diffpure_steps": diffpure_steps,
+        "sweep_strengths": bool(sweep_strengths),
+    }
+
+
+def _format_eta(seconds: float) -> str:
+    if seconds != seconds or seconds < 0:  # NaN
+        return "?"
+    s = int(seconds)
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    if h:
+        return f"{h}h{m:02d}m"
+    if m:
+        return f"{m}m{sec:02d}s"
+    return f"{sec}s"
+
+
+def _precompute_watermarked(
+    encoder: nn.Module,
+    decoder: nn.Module,
+    val_loader: DataLoader,
+    *,
+    device: str,
+    msg_len: int,
+    seed: int,
+    max_batches: Optional[int],
+    collect_clean_stats: bool,
+) -> Tuple[List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]], List[float]]:
+    """One loader pass: optional clean detection stats + CPU-cached (x, m, x_w).
+
+    Caching watermarked tensors avoids re-encoding on every attack×strength combo
+    (same message seed is reset per combo, so results stay identical).
+    """
+    k = int(msg_len)
+    det_gen = torch.Generator(device="cpu")
+    det_gen.manual_seed(int(seed) + 17_389)
+    wm_gen = torch.Generator(device="cpu")
+    wm_gen.manual_seed(int(seed) + 17_389)
+    pairs: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+    clean_stats: List[float] = []
+    n_batches = _batch_count(val_loader, max_batches)
+    t0 = time.perf_counter()
+    print(
+        f"[eval] precomputing watermarked covers ({n_batches} batches)...",
+        flush=True,
+    )
+    encoder.eval()
+    decoder.eval()
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(_iter_batches(val_loader, max_batches)):
+            x = batch[0].to(device, non_blocking=True)
+            if collect_clean_stats:
+                m_ref = sample_bits(x.size(0), k, device=device, generator=det_gen)
+                logits_clean = decoder(x)
+                clean_stats.extend(matched_bit_counts(logits_clean, m_ref).cpu().tolist())
+            m = sample_bits(x.size(0), k, device=device, generator=wm_gen)
+            x_w = encoder(x, m)
+            pairs.append((x.detach().cpu(), m.detach().cpu(), x_w.detach().cpu()))
+            if (
+                batch_idx == 0
+                or (batch_idx + 1) % max(1, n_batches // 5) == 0
+                or batch_idx + 1 == n_batches
+            ):
+                print(
+                    f"[eval] precompute batch {batch_idx + 1}/{n_batches}",
+                    flush=True,
+                )
+    print(
+        f"[eval] precompute done in {time.perf_counter() - t0:.1f}s "
+        f"({len(pairs)} batches cached on CPU)",
+        flush=True,
+    )
+    return pairs, clean_stats
 
 
 def apply_attack(
@@ -103,6 +248,8 @@ def evaluate_protocol(
     regen_cfg = config.get("regen", {})
     encoder.eval()
     decoder.eval()
+    if str(device).startswith("cuda"):
+        configure_eval_cuda()
 
     if attacks is None:
         attacks = [s.id for s in ATTACK_REGISTRY if not s.not_evaluated]
@@ -113,28 +260,47 @@ def evaluate_protocol(
     rows: List[Dict[str, Any]] = []
     k = int(msg_len)
     det_ok = detection_applicable(k)
-    # Identical seeded bit sampling for every scheme (reproducible across baselines).
-    msg_gen = torch.Generator(device="cpu")
-    msg_gen.manual_seed(int(seed) + 17_389)
     n_batches = _batch_count(val_loader, max_batches)
+    try:
+        loader_bs = int(getattr(val_loader, "batch_size", None) or 1)
+    except TypeError:
+        loader_bs = 1
+    workload = estimate_eval_workload(
+        attacks,
+        n_batches=n_batches,
+        batch_size=loader_bs,
+        sweep_strengths=bool(sweep_strengths) and not quality_only,
+        config=config,
+    )
+    print(
+        f"[eval] workload: ~{workload['n_images_approx']} images × "
+        f"{workload['attack_strength_combos']} attack/strength combos "
+        f"({workload['heavy_combos']} heavy); "
+        f"~{workload['approx_diffusion_unet_forwards']:,} diffusion UNet forwards "
+        f"(diffpure_steps={workload['diffpure_steps']}, "
+        f"sweep={workload['sweep_strengths']})",
+        flush=True,
+    )
 
-    # Clean, never-watermarked detection statistics (shared across attacks).
-    clean_stats: List[float] = []
-    if compute_detection and det_ok:
-        with torch.no_grad():
-            for batch in _iter_batches(val_loader, max_batches):
-                x = batch[0].to(device)
-                m_ref = sample_bits(x.size(0), k, device=device, generator=msg_gen)
-                logits_clean = decoder(x)
-                clean_stats.extend(matched_bit_counts(logits_clean, m_ref).cpu().tolist())
-        if len(clean_stats) < 5000:
-            print(
-                f"[WARNING] clean detection set has {len(clean_stats)} < 5000 images; "
-                "0.1% FPR cannot be estimated reliably"
-            )
-    elif compute_detection and not det_ok:
+    collect_det = bool(compute_detection and det_ok)
+    if compute_detection and not det_ok:
         print(
             f"[eval] detection metrics not applicable for msg_len={k} (zero-bit scheme)"
+        )
+    pairs, clean_stats = _precompute_watermarked(
+        encoder,
+        decoder,
+        val_loader,
+        device=device,
+        msg_len=k,
+        seed=int(seed),
+        max_batches=max_batches,
+        collect_clean_stats=collect_det,
+    )
+    if collect_det and len(clean_stats) < 5000:
+        print(
+            f"[WARNING] clean detection set has {len(clean_stats)} < 5000 images; "
+            "0.1% FPR cannot be estimated reliably"
         )
 
     for attack_id in attacks:
@@ -173,23 +339,12 @@ def evaluate_protocol(
             pert_linf: List[float] = []
             pert_lpips: List[float] = []
 
-            # Reset message RNG per (attack, strength) so every transform sees
-            # the same cover→message pairing (fair across schemes).
-            msg_gen.manual_seed(int(seed) + 17_389)
-            heavy = spec.id in (
-                "diffpure",
-                "rinse_2",
-                "rinse_4",
-                "regen_proxy",
-                "guided_regen",
-                "bmshj2018",
-                "cheng2020",
-            )
-            for batch_idx, batch in enumerate(_iter_batches(val_loader, max_batches)):
-                x = batch[0].to(device)
-                m = sample_bits(x.size(0), k, device=device, generator=msg_gen)
-                with torch.no_grad():
-                    x_w = encoder(x, m)
+            heavy = spec.id in _HEAVY_ATTACKS
+            t_attack = time.perf_counter()
+            for batch_idx, (x_cpu, m_cpu, x_w_cpu) in enumerate(pairs):
+                x = x_cpu.to(device, non_blocking=True)
+                m = m_cpu.to(device, non_blocking=True)
+                x_w = x_w_cpu.to(device, non_blocking=True)
                 text_embeds = make_text_embeds(
                     x.size(0),
                     device,
@@ -243,9 +398,14 @@ def evaluate_protocol(
                     or (batch_idx + 1) % max(1, n_batches // 5) == 0
                     or batch_idx + 1 == n_batches
                 ):
+                    done = batch_idx + 1
+                    elapsed = time.perf_counter() - t_attack
+                    rate = elapsed / max(done, 1)
+                    eta = rate * max(n_batches - done, 0)
                     print(
                         f"[eval] {spec.id} strength={strength}: "
-                        f"batch {batch_idx + 1}/{n_batches}",
+                        f"batch {done}/{n_batches} "
+                        f"({elapsed:.0f}s elapsed, ETA {_format_eta(eta)})",
                         flush=True,
                     )
 

@@ -107,8 +107,14 @@ def rinse(
     repeats: int,
     purifier: Optional[EvalDiffPure] = None,
     t_start: float = 0.4,
+    *,
+    verbose: bool = False,
 ) -> torch.Tensor:
-    """Apply diffusion purification ``repeats`` times (WAVES Regen-2x / 4x)."""
+    """Apply diffusion purification ``repeats`` times (WAVES Regen-2x / 4x).
+
+    Per-pass prints are off by default — ``evaluate_protocol`` already reports
+    batch ETA for ``rinse_4``, and pass spam made long runs look wedged.
+    """
     n = max(int(repeats), 1)
     y = x
     for i in range(n):
@@ -118,7 +124,7 @@ def rinse(
             y = purifier(y, t_start=t_start)
         # Detach between passes so rinse_4 cannot chain autograd across repeats.
         y = y.detach()
-        if n >= 4 and (i == 0 or (i + 1) % 2 == 0):
+        if verbose and n >= 4 and (i == 0 or (i + 1) % 2 == 0):
             print(f"[eval] rinse pass {i + 1}/{n} done", flush=True)
     return y.clamp(-1, 1)
 

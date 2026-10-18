@@ -140,6 +140,12 @@ eval:
   val_full_every: 20
   # Cap val loader batches (null = full val split). Speeds monitoring a lot on COCO.
   val_max_batches: 32
+  # Cap infer.py test batches (null = full test split). Prefer --fast / --max-batches for smokes;
+  # paper runs must leave this null (5k COCO test images).
+  max_batches: null
+  # Optional infer-only batch size (null = use global batch_size). Diffusion attacks under-utilise
+  # a 16GB card at batch 8 / 256² — 16–24 is usually a free throughput win.
+  batch_size: 16
   # LPIPS/SSIM/PSNR during train val (slow). Final quality belongs in infer.py.
   val_compute_quality: false
   # DiffPure / rinse use a DIFFERENT diffusion checkpoint than regen.sd_model_id.

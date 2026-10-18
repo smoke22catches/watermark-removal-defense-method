@@ -94,6 +94,16 @@ python scripts/infer.py --checkpoint runs/<run>/checkpoints/best.pt \
   --dataset coco --device cuda --attacks clean,jpeg,regen_proxy,guided_regen,unseen_blur \
   --run-name eval_coco
 
+# Fast iteration (skips DiffPure/rinse/compressai, caps batches, mid strengths)
+python scripts/infer.py --checkpoint runs/<run>/checkpoints/best.pt \
+  --dataset coco --device cuda --fast --run-name eval_smoke
+
+# Full paper protocol (5k test + strength grid) is dominated by DiffPure/rinse_4 —
+# use eval.batch_size≥16 and expect many GPU-hours; see eval.max_batches to cap smokes.
+python scripts/infer.py --checkpoint runs/<run>/checkpoints/best.pt \
+  --dataset coco --device cuda --image-size 256 --sweep-strengths --batch-size 16 \
+  --run-name eval_full
+
 # Comparative baselines (TrustMark / StegaStamp / VINE) — see docs/baselines.md
 python scripts/install_baselines.py          # packages + weights (once)
 python scripts/infer.py --scheme trustmark --dataset coco --device cuda \

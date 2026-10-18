@@ -31,7 +31,13 @@ from src.data.splits import (
     DEFAULT_SPLITS_DIR,
     verify_infer_no_train_overlap,
 )
-from src.engine.evaluate import apply_attack, evaluate_protocol, evaluate_single_image
+from src.engine.evaluate import (
+    apply_attack,
+    configure_eval_cuda,
+    estimate_eval_workload,
+    evaluate_protocol,
+    evaluate_single_image,
+)
 from src.engine.train import _build_regen_branch
 from src.models import Decoder, Encoder
 from src.utils.config import apply_set_overrides, load_yaml
@@ -81,6 +87,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--msg-len", type=int, default=None)
     p.add_argument("--image-size", type=int, default=None)
     p.add_argument("--batch-size", type=int, default=None)
+    p.add_argument(
+        "--max-batches",
+        type=int,
+        default=None,
+        help="Cap test batches (overrides eval.max_batches). Full paper runs omit this.",
+    )
     p.add_argument("--num-workers", type=int, default=None)
     p.add_argument("--seed", type=int, default=None)
     p.add_argument(
@@ -99,6 +111,14 @@ def parse_args() -> argparse.Namespace:
         "--quality-only",
         action="store_true",
         help="Measure PSNR/SSIM/LPIPS/FID of watermarked vs cover (no attack)",
+    )
+    p.add_argument(
+        "--fast",
+        action="store_true",
+        help=(
+            "Smoke-eval preset: mid strengths only, skip DiffPure/rinse/compressai, "
+            "cap at 32 batches (overridden by --max-batches / --attacks)"
+        ),
     )
     p.add_argument("--set", dest="set_overrides", action="append", default=[])
     return p.parse_args()
@@ -236,6 +256,31 @@ def main() -> None:
         cfg["seed"] = args.seed
     apply_set_overrides(cfg, args.set_overrides)
 
+    eval_cfg = cfg.setdefault("eval", {})
+    if not isinstance(eval_cfg, dict):
+        eval_cfg = {}
+        cfg["eval"] = eval_cfg
+    # Infer-only larger default batch (diffusion under-fills the GPU at train batch_size).
+    if args.batch_size is None and eval_cfg.get("batch_size") is not None:
+        cfg["batch_size"] = int(eval_cfg["batch_size"])
+    if args.max_batches is not None:
+        eval_cfg["max_batches"] = int(args.max_batches)
+    if args.fast:
+        # Keep protocol knobs intact unless the user did not override them.
+        if args.attacks is None and not args.quality_only:
+            args.attacks = (
+                "clean,jpeg,rotate,crop,noise,unseen_blur,"
+                "regen_proxy,guided_regen,adv"
+            )
+        if args.max_batches is None and eval_cfg.get("max_batches") is None:
+            eval_cfg["max_batches"] = 32
+        args.sweep_strengths = False
+        print(
+            "[infer] --fast: mid strengths only, max_batches="
+            f"{eval_cfg.get('max_batches')}, attacks={args.attacks}",
+            flush=True,
+        )
+
     seed = int(cfg.get("seed", 42))
     cfg["seed"] = seed
     set_seed(seed)
@@ -244,6 +289,8 @@ def main() -> None:
         print("[infer] CUDA unavailable; using CPU.")
         device = "cpu"
         cfg["device"] = device
+    if device.startswith("cuda"):
+        configure_eval_cuda()
 
     run_dir = create_run_dir(args.runs_root, str(cfg.get("run_name", "eval")), seed=seed)
     logger = RunLogger(run_dir, cfg, metrics_filename="results.csv")
@@ -469,10 +516,30 @@ def main() -> None:
                     "[warn] no train_list in checkpoint run_meta; "
                     "skipping train/test overlap safety check"
                 )
+            max_batches = eval_cfg.get("max_batches")
+            max_batches_i = int(max_batches) if max_batches is not None else None
+            n_loader = len(test_loader)
+            n_eff = n_loader if max_batches_i is None else min(n_loader, max_batches_i)
+            workload = estimate_eval_workload(
+                attacks,
+                n_batches=n_eff,
+                batch_size=int(cfg.get("batch_size", 4)),
+                sweep_strengths=bool(args.sweep_strengths) and not args.quality_only,
+                config=cfg,
+            )
             logger.log(
-                f"Test batches: {len(test_loader)}  "
+                f"Test batches: {n_eff}/{n_loader} (max_batches={max_batches_i})  "
+                f"batch_size={cfg.get('batch_size')}  "
                 f"split_hashes={split_info.get('split_hashes')}  "
                 f"(seed={seed} does not change test membership)"
+            )
+            logger.log(
+                f"Estimated diffusion UNet forwards≈"
+                f"{workload['approx_diffusion_unet_forwards']:,} across "
+                f"{workload['attack_strength_combos']} attack/strength combos "
+                f"({workload['heavy_combos']} heavy). "
+                f"Tip: omit --sweep-strengths, raise --batch-size, or use --fast "
+                f"for iteration; full paper runs need the uncapped test split."
             )
             rows = evaluate_protocol(
                 encoder,
@@ -491,6 +558,7 @@ def main() -> None:
                 compute_fid=True,
                 compute_quality=True,
                 quality_only=bool(args.quality_only),
+                max_batches=max_batches_i,
             )
             logger.log_metric_rows(rows)
             means = {}
